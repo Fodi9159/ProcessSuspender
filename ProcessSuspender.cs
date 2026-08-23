@@ -707,6 +707,17 @@ public static class ProcessSuspenderApp
     {
         if (down)
         {
+            if (!IsAnySuspended())
+            {
+                // Nothing to resume, but keep the hold alive through the physical
+                // press so the worker cannot freeze the target mid-gesture. Skip
+                // the expensive hit-testing (EnumWindows / UIA / process enum) -
+                // this runs inside the low-level mouse hook.
+                mouseSwitching = true;
+                mouseDownWasSwitch = false;
+                lastSwitchActivity = DateTime.UtcNow;
+                return;
+            }
             string reason = SwitchAreaReason(x, y);
             mouseDownWasSwitch = reason != null;
             if (!mouseDownWasSwitch) return;
@@ -760,44 +771,49 @@ public static class ProcessSuspenderApp
         IntPtr hit = WindowFromPoint(x, y);
         if (hit == IntPtr.Zero) return null;
         if (PointInsideForegroundWindow(x, y)) return null;
+
+        // Snapshot under lock; the matching below enumerates processes and reads
+        // window state, which must not run while holding StateLock on the hook thread.
+        List<WindowTarget> targets;
+        string name;
         lock (StateLock)
         {
-            if (WindowTargets.Count > 0)
+            targets = WindowTargets.ToList();
+            name = targetName;
+        }
+
+        if (targets.Count > 0)
+        {
+            foreach (WindowTarget t in targets)
             {
-                foreach (WindowTarget t in WindowTargets)
+                if (hit == t.Hwnd || IsChild(t.Hwnd, hit))
                 {
-                    if (hit == t.Hwnd || IsChild(t.Hwnd, hit))
-                    {
-                        if (IsBackdropClick(x, y, t.Hwnd)) return null;
-                        return "click on target window";
-                    }
+                    if (IsBackdropClick(x, y, t.Hwnd)) return null;
+                    return "click on target window";
                 }
-                return null;
-            }
-            if (targetName != null)
-            {
-                // Only the process's main window(s) - and their children - count as
-                // a switch-back target. A second window of the game process (a
-                // launcher, a companion window) must not unfreeze the game.
-                try
-                {
-                    foreach (Process p in Process.GetProcessesByName(targetName))
-                    {
-                        IntPtr mw = p.MainWindowHandle;
-                        if (mw == IntPtr.Zero) continue;
-                        if (hit == mw || IsChild(mw, hit))
-                        {
-                            if (!IsWindowVisible(hit)) return null;
-                            if (IsBackdropClick(x, y, mw)) return null;
-                            return "click on target window";
-                        }
-                    }
-                }
-                catch { }
-                return null;
             }
             return null;
         }
+        if (name == null) return null;
+        // Only the process's main window(s) - and their children - count as
+        // a switch-back target. A second window of the game process (a
+        // launcher, a companion window) must not unfreeze the game.
+        try
+        {
+            foreach (Process p in Process.GetProcessesByName(name))
+            {
+                IntPtr mw = p.MainWindowHandle;
+                if (mw == IntPtr.Zero) continue;
+                if (hit == mw || IsChild(mw, hit))
+                {
+                    if (!IsWindowVisible(hit)) return null;
+                    if (IsBackdropClick(x, y, mw)) return null;
+                    return "click on target window";
+                }
+            }
+        }
+        catch { }
+        return null;
     }
 
     /// <summary>True when (x, y) lies within the rectangle of the currently focused window.</summary>
@@ -1275,25 +1291,28 @@ public static class ProcessSuspenderApp
 
     private static string GetTargetTitle()
     {
+        IntPtr hwnd = IntPtr.Zero;
+        string name = null;
+        lock (StateLock)
+        {
+            if (targetName != null) name = targetName;
+            else if (WindowTargets.Count > 0) hwnd = WindowTargets[0].Hwnd;
+        }
         try
         {
-            lock (StateLock)
+            if (name != null)
             {
-                if (targetName != null)
+                foreach (Process p in Process.GetProcessesByName(name))
                 {
-                    foreach (Process p in Process.GetProcessesByName(targetName))
+                    if (p.MainWindowHandle != IntPtr.Zero)
                     {
-                        if (p.MainWindowHandle != IntPtr.Zero)
-                        {
-                            string t = GetWindowTitle(p.MainWindowHandle);
-                            if (t.Length > 0) return t;
-                        }
+                        string t = GetWindowTitle(p.MainWindowHandle);
+                        if (t.Length > 0) return t;
                     }
-                    return "";
                 }
-                if (WindowTargets.Count > 0)
-                    return GetWindowTitle(WindowTargets[0].Hwnd);
+                return "";
             }
+            if (hwnd != IntPtr.Zero) return GetWindowTitle(hwnd);
         }
         catch { }
         return "";
@@ -1302,25 +1321,37 @@ public static class ProcessSuspenderApp
     private static readonly string[] TaskbarClassNames = { "Shell_TrayWnd", "Shell_SecondaryTrayWnd" };
 
     /// <summary>All taskbars on all monitors (primary is Shell_TrayWnd, additional are Shell_SecondaryTrayWnd).</summary>
+    private static readonly List<IntPtr> taskbarWindows = new List<IntPtr>();
+    private static DateTime taskbarWindowsAt = DateTime.MinValue;
+
+    /// <summary>
+    /// All taskbars on all monitors, cached for 500ms. Runs inside the low-level
+    /// mouse hook on every left click, so the full EnumWindows scan must not run
+    /// per event. Callers must treat the returned list as read-only.
+    /// </summary>
     private static List<IntPtr> EnumTaskbars()
     {
-        var list = new List<IntPtr>();
-        EnumWindows(delegate(IntPtr h, IntPtr l)
+        if ((DateTime.UtcNow - taskbarWindowsAt).TotalMilliseconds >= 500)
         {
-            var sb = new StringBuilder(128);
-            GetClassName(h, sb, sb.Capacity);
-            string cls = sb.ToString();
-            for (int i = 0; i < TaskbarClassNames.Length; i++)
+            taskbarWindowsAt = DateTime.UtcNow;
+            taskbarWindows.Clear();
+            EnumWindows(delegate(IntPtr h, IntPtr l)
             {
-                if (cls == TaskbarClassNames[i])
+                var sb = new StringBuilder(128);
+                GetClassName(h, sb, sb.Capacity);
+                string cls = sb.ToString();
+                for (int i = 0; i < TaskbarClassNames.Length; i++)
                 {
-                    list.Add(h);
-                    break;
+                    if (cls == TaskbarClassNames[i])
+                    {
+                        taskbarWindows.Add(h);
+                        break;
+                    }
                 }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return list;
+                return true;
+            }, IntPtr.Zero);
+        }
+        return taskbarWindows;
     }
 
     private static bool IsInTaskbar(int x, int y)
@@ -1552,7 +1583,16 @@ public static class ProcessSuspenderApp
         }
     }
 
-    private static void TickWindowMode(int tick)
+    /// <summary>FOCUSLOCK_TEST_FGPID is set by the test harness before launch; read once.</summary>
+    private static readonly string TestFgPidOverride =
+        Environment.GetEnvironmentVariable("FOCUSLOCK_TEST_FGPID") ?? "";
+
+    /// <summary>
+    /// Shared switch-gesture/grace computation for both tick modes: while a switch
+    /// gesture is active the target must keep running (up to SwitchGestureTimeoutMs),
+    /// and after the last gesture event it gets PostSwitchGraceMs of grace.
+    /// </summary>
+    private static bool ComputeHolding()
     {
         bool switchingNow = kbdSwitching || mouseSwitching;
         bool holding = switchingNow;
@@ -1564,19 +1604,31 @@ public static class ProcessSuspenderApp
         }
         if (!holding && (DateTime.UtcNow - lastSwitchActivity).TotalMilliseconds < PostSwitchGraceMs)
             holding = true;
+        return holding;
+    }
 
+    /// <summary>Foreground pid, overridden by FOCUSLOCK_TEST_FGPID when set.</summary>
+    private static uint ResolveForegroundPid()
+    {
         uint fgPid = 0;
-        string testPid = Environment.GetEnvironmentVariable("FOCUSLOCK_TEST_FGPID");
-        if (!string.IsNullOrEmpty(testPid))
-            uint.TryParse(testPid, out fgPid);
+        if (!string.IsNullOrEmpty(TestFgPidOverride))
+            uint.TryParse(TestFgPidOverride, out fgPid);
         if (fgPid == 0)
         {
             IntPtr fg = GetForegroundWindow();
             if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
         }
+        return fgPid;
+    }
+
+    private static void TickWindowMode(int tick)
+    {
+        bool holding = ComputeHolding();
+        uint fgPid = ResolveForegroundPid();
 
         bool ignoreMinimize = Config != null && !Config.SuspendWhenMinimized;
 
+        List<int> childScans = new List<int>();
         lock (StateLock)
         {
             foreach (WindowTarget t in WindowTargets)
@@ -1593,9 +1645,10 @@ public static class ProcessSuspenderApp
                 {
                     // ponytail: WMI Win32_Process query is the heavy call; re-scan only
                     // on the suspend transition or every 2s, never on every 250ms tick.
+                    // The query itself runs outside StateLock (see below).
                     if (!wasSuspended || tick % 8 == 0)
                     {
-                        SuspendChildrenOf(t);
+                        childScans.Add(pid);
                         t.ChildrenLive = true;
                     }
                 }
@@ -1606,6 +1659,7 @@ public static class ProcessSuspenderApp
                 }
             }
         }
+        foreach (int parentPid in childScans) SuspendChildrenOf(parentPid);
     }
 
     // When the main window is suspended, also suspend its child worker processes
@@ -1615,9 +1669,9 @@ public static class ProcessSuspenderApp
     // names are skipped by ApplyLocked's own guard.
     // WMI is used for child enumeration (GetChildProcesses needs .NET 4.7.1,
     // this targets .NET 4.0). System.Management ships with the framework.
-    private static void SuspendChildrenOf(WindowTarget t)
+    private static void SuspendChildrenOf(int parentPid)
     {
-        int parentPid = (int)t.Pid;
+        var children = new List<uint>();
         try
         {
             using (var searcher = new System.Management.ManagementObjectSearcher(
@@ -1627,40 +1681,33 @@ public static class ProcessSuspenderApp
                 {
                     uint cidU;
                     if (!uint.TryParse(mo["ProcessId"].ToString(), out cidU)) continue;
-                    int cid = (int)cidU;
-                    if (cid == parentPid) continue;
-                    if (Process.GetCurrentProcess().Id == cid) continue;
-                    if (IsNeverSuspendPid((uint)cid)) continue;
-                    OpenHandleLocked(cid);
-                    ApplyLocked(cid, false, 0, false);
+                    if (cidU == (uint)parentPid) continue;
+                    children.Add(cidU);
                 }
             }
         }
-        catch { }
+        catch { return; }
+
+        // WMI ran outside StateLock so input-hook resumptions never wait on a
+        // slow query; only the apply pass takes the lock.
+        int selfPid = Process.GetCurrentProcess().Id;
+        lock (StateLock)
+        {
+            foreach (uint c in children)
+            {
+                int cid = (int)c;
+                if (cid == selfPid) continue;
+                if (IsNeverSuspendPid((uint)cid)) continue;
+                OpenHandleLocked(cid);
+                ApplyLocked(cid, false, 0, false);
+            }
+        }
     }
 
     private static void TickNameMode()
     {
-        bool switchingNow = kbdSwitching || mouseSwitching;
-        bool holding = switchingNow;
-        if (switchingNow && (DateTime.UtcNow - lastSwitchActivity).TotalMilliseconds > SwitchGestureTimeoutMs)
-        {
-            kbdSwitching = false;
-            mouseSwitching = false;
-            holding = false;
-        }
-        if (!holding && (DateTime.UtcNow - lastSwitchActivity).TotalMilliseconds < PostSwitchGraceMs)
-            holding = true;
-
-        uint fgPid = 0;
-        string testPid = Environment.GetEnvironmentVariable("FOCUSLOCK_TEST_FGPID");
-        if (!string.IsNullOrEmpty(testPid))
-            uint.TryParse(testPid, out fgPid);
-        if (fgPid == 0)
-        {
-            IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
-        }
+        bool holding = ComputeHolding();
+        uint fgPid = ResolveForegroundPid();
 
         bool ignoreMinimize = Config != null && !Config.SuspendWhenMinimized;
 
@@ -1670,7 +1717,7 @@ public static class ProcessSuspenderApp
             foreach (int pid in Handles.Keys) NamePids.Add(pid);
             foreach (int pid in Handles.Keys.ToList())
             {
-                bool focused = fgPid != 0 && Handles.ContainsKey((int)fgPid) && (int)fgPid == pid;
+                bool focused = fgPid != 0 && (int)fgPid == pid;
                 if (ignoreMinimize && !focused) focused = Minimized.Contains(pid);
                 ApplyLocked(pid, focused, fgPid, holding);
             }
