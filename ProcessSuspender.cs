@@ -25,6 +25,8 @@ public static class ProcessSuspenderApp
     private static extern int NtResumeProcess(IntPtr h);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder path, ref uint size);
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr h);
     [DllImport("user32.dll")]
@@ -119,7 +121,7 @@ public static class ProcessSuspenderApp
     private static readonly HashSet<int> NamePids = new HashSet<int>();
 
     private static string targetName;
-    private static bool enabled = true;
+    private static volatile bool enabled = true;
     private static volatile int pollMs = 250;
     private static Thread worker;
     private static volatile bool running;
@@ -325,15 +327,31 @@ public static class ProcessSuspenderApp
             && r.Right <= b.Right + tolerance && r.Bottom <= b.Bottom + tolerance;
     }
 
+    // Core Windows processes used to classify a pid as "system" when its image
+    // path cannot be read (protected/elevated process). Never auto-lock these.
+    private static readonly HashSet<string> CoreSystemNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    { "system", "idle", "registry", "smss", "csrss", "wininit", "winlogon", "services",
+      "lsass", "svchost", "dwm", "fontdrvhost", "sihost", "explorer" };
+
     private static bool IsSystemProcess(uint pid)
     {
+        IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (h != IntPtr.Zero)
+        {
+            try
+            {
+                var sb = new StringBuilder(1024);
+                uint size = (uint)sb.Capacity;
+                // Limited query survives elevation where MainModule (needs more access) throws.
+                if (QueryFullProcessImageName(h, 0, sb, ref size))
+                    return sb.ToString(0, (int)size).StartsWith(Environment.GetEnvironmentVariable("SystemRoot") ?? @"C:\Windows", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { }
+            finally { CloseHandle(h); }
+        }
         try
         {
-            using (var p = Process.GetProcessById((int)pid))
-            {
-                string path = p.MainModule.FileName;
-                return path.StartsWith(@"C:\Windows\", StringComparison.OrdinalIgnoreCase);
-            }
+            return CoreSystemNames.Contains(Process.GetProcessById((int)pid).ProcessName);
         }
         catch { return true; }
     }
@@ -1405,62 +1423,74 @@ public static class ProcessSuspenderApp
         int tick = 0;
         while (running)
         {
-            if (!enabled)
+            try
             {
-                ResumeAll();
-                Thread.Sleep(pollMs);
-                continue;
+                RunWorkerTick(tick);
             }
-
-            uint fgPid = 0;
-            IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
-            if (fgPid != lastFgPid)
+            catch (Exception ex)
             {
-                lastFgPid = fgPid;
-                Log("[FG] foreground: pid " + fgPid + " (" + DescribeProcess((int)fgPid)
-                    + "), title=\"" + GetWindowTitle(fg) + "\"");
+                // A background-thread exception would tear down the whole process;
+                // log and keep polling instead.
+                try { Log("[WARN] Worker error: " + ex.Message); } catch { }
             }
-
-            lock (StateLock)
-            {
-                if (targetName == null && WindowTargets.Count == 0
-                    && Config != null && Config.AutoLockFullscreen
-                    && fgPid != 0 && fg != IntPtr.Zero)
-                {
-                    IntPtr lockTarget = IntPtr.Zero;
-                    uint lockPid = 0;
-                    if (!IsSystemProcess(fgPid) && IsFullscreen(fg))
-                    {
-                        lockTarget = fg;
-                        lockPid = fgPid;
-                    }
-                    else if (IsSystemProcess(fgPid))
-                    {
-                        lockTarget = FindFullscreenWindow();
-                        if (lockTarget != IntPtr.Zero)
-                            GetWindowThreadProcessId(lockTarget, out lockPid);
-                    }
-                    if (lockTarget != IntPtr.Zero && lockPid != 0
-                        && lockPid != (uint)Process.GetCurrentProcess().Id
-                        && !IsNeverSuspendPid(lockPid))
-                        SetTargetWindow(lockTarget, lockPid);
-                }
-            }
-
-            if (targetName != null)
-            {
-                if (tick % 4 == 0) RefreshNameTargets();
-                TickNameMode();
-            }
-            else
-            {
-                if (tick % 4 == 0) RefreshWindowTargets();
-                TickWindowMode(tick);
-            }
-
             tick++;
             Thread.Sleep(pollMs);
+        }
+    }
+
+    private static void RunWorkerTick(int tick)
+    {
+        if (!enabled)
+        {
+            ResumeAll();
+            return;
+        }
+
+        uint fgPid = 0;
+        IntPtr fg = GetForegroundWindow();
+        if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
+        if (fgPid != lastFgPid)
+        {
+            lastFgPid = fgPid;
+            Log("[FG] foreground: pid " + fgPid + " (" + DescribeProcess((int)fgPid)
+                + "), title=\"" + GetWindowTitle(fg) + "\"");
+        }
+
+        lock (StateLock)
+        {
+            if (targetName == null && WindowTargets.Count == 0
+                && Config != null && Config.AutoLockFullscreen
+                && fgPid != 0 && fg != IntPtr.Zero)
+            {
+                IntPtr lockTarget = IntPtr.Zero;
+                uint lockPid = 0;
+                if (!IsSystemProcess(fgPid) && IsFullscreen(fg))
+                {
+                    lockTarget = fg;
+                    lockPid = fgPid;
+                }
+                else if (IsSystemProcess(fgPid))
+                {
+                    lockTarget = FindFullscreenWindow();
+                    if (lockTarget != IntPtr.Zero)
+                        GetWindowThreadProcessId(lockTarget, out lockPid);
+                }
+                if (lockTarget != IntPtr.Zero && lockPid != 0
+                    && lockPid != (uint)Process.GetCurrentProcess().Id
+                    && !IsNeverSuspendPid(lockPid))
+                    SetTargetWindow(lockTarget, lockPid);
+            }
+        }
+
+        if (targetName != null)
+        {
+            if (tick % 4 == 0) RefreshNameTargets();
+            TickNameMode();
+        }
+        else
+        {
+            if (tick % 4 == 0) RefreshWindowTargets();
+            TickWindowMode(tick);
         }
     }
 
@@ -1552,6 +1582,9 @@ public static class ProcessSuspenderApp
             foreach (WindowTarget t in WindowTargets)
             {
                 int pid = (int)t.Pid;
+                // Reopen handles lost to a stale-suspend failure so window-mode
+                // targets recover instead of going permanently inert.
+                if (!Handles.ContainsKey(pid)) OpenHandleLocked(pid);
                 bool focused = (int)fgPid == pid;
                 if (ignoreMinimize && !focused) focused = IsIconic(t.Hwnd);
                 bool wasSuspended = Suspended.Contains(pid);
@@ -1646,6 +1679,9 @@ public static class ProcessSuspenderApp
 
     private static void ApplyLocked(int pid, bool focused, uint fgPid, bool hold)
     {
+        // Stop() may have resumed everything and released StateLock while this tick
+        // was already in flight; never suspend after shutdown began.
+        if (!running) return;
         IntPtr h;
         if (!Handles.TryGetValue(pid, out h)) return;
         bool isSuspended = Suspended.Contains(pid);
@@ -1678,7 +1714,12 @@ public static class ProcessSuspenderApp
             }
             else
             {
-                DropHandleLocked(pid);
+                // Handle went stale (target restarting, access revoked). Close it so
+                // the next tick reopens fresh instead of dropping the lock target.
+                CloseHandle(h);
+                Handles.Remove(pid);
+                Suspended.Remove(pid);
+                WarnedPids.Remove(pid);
             }
         }
         else if (focused && isSuspended)

@@ -102,7 +102,19 @@ public static class SettingsStore
                 }
             }
         }
-        catch { }
+        catch
+        {
+            // Unreadable/corrupt config: preserve it before defaults overwrite it.
+            try
+            {
+                if (File.Exists(ConfigPath))
+                {
+                    File.Copy(ConfigPath, ConfigPath + ".bak", true);
+                    ProcessSuspenderApp.Log("[WARN] settings.json was unreadable - backed up to settings.json.bak, writing defaults.");
+                }
+            }
+            catch { }
+        }
 
         Settings def = new Settings();
         Save(def);
