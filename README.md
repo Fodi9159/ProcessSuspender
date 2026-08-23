@@ -22,10 +22,10 @@ Right-click the tray icon:
 | Item | Action |
 |---|---|
 | *(status line)* | Shows current target window title + running/SUSPENDED state |
-| Freeze on defocus | Freeze/unfreeze toggle: suspends the target on defocus, unfreezing resumes everything and brings the game to the foreground |
+| Enable/disable the app | Freeze/unfreeze toggle: suspends the target on defocus; disabling resumes everything and brings the game to the foreground |
 | Pick window... | Choose the target from a list of visible windows |
 | Poll interval | 125 / 250 / 500 / 1000 ms |
-| Settings... | Settings window (target, poll, toggles) |
+| Settings... | Settings window (poll, auto-lock, auto-start, hotkeys, never-suspend list, locked windows) |
 | Show log | Settings window on the Log tab |
 | Open config folder | Reveals `%APPDATA%\ProcessSuspender` in Explorer |
 | Quit | Resumes all targets, exits |
@@ -110,4 +110,4 @@ catch (e.g. Win+Tab task view).
 ## Test hook
 
 `FOCUSLOCK_TEST_FGPID=<pid>` overrides the foreground window detection with a fixed pid
-(used by the automated test suite; normally unset).
+(manual test hook; normally unset).
