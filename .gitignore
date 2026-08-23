@@ -1,0 +1,6 @@
+*.exe
+*.exe.orig
+*.log
+.firecrawl/
+.freebuff/
+.agents/
