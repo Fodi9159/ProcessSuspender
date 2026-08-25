@@ -17,7 +17,7 @@ public static class ProcessSuspenderApp
     private const uint PROCESS_ALL = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION;
     private const int LogCapacity = 500;
     private const int SwitchGestureTimeoutMs = 5000;
-    private const int PostSwitchGraceMs = 2000;
+    private const int PostSwitchGraceMs = 500;
 
     [DllImport("ntdll.dll")]
     private static extern int NtSuspendProcess(IntPtr h);
@@ -683,17 +683,52 @@ public static class ProcessSuspenderApp
 
     /// <summary>
     /// The user pressed or released Alt+Tab (a real switch gesture, as detected by
-    /// the keyboard hook). The moment the gesture starts we resume the target - a
-    /// suspended process can never receive window activation, so it must be running
-    /// before the user's switch can land on it. The last event timestamp keeps it
-    /// running for a short grace period after the gesture ends; if the user settles
-    /// on another window, the next poll re-suspends it.
+    /// the keyboard hook). Nothing is activated while the switcher is open - only
+    /// the highlight moves - so we stay quiet during the gesture and resume at
+    /// gesture END (Alt released): that is the moment Windows activates whichever
+    /// window is highlighted, and the hook sees the key-up before the shell does,
+    /// so the resume still lands before the activation attempt. Tabbing past the
+    /// target without releasing Alt on it therefore never wakes it.
     /// </summary>
     public static void OnSwitchStateChanged(bool active)
     {
         kbdSwitching = active;
         lastSwitchActivity = DateTime.UtcNow;
-        if (active) ResumeSuspended("switch gesture started");
+        if (active)
+        {
+            // Gesture START while a locked target is foreground: suspend it right
+            // now instead of holding it for the whole gesture - alt-tabbing away
+            // means it is leaving focus, so freeze immediately.
+            SuspendForegroundTarget("alt-tab gesture started");
+        }
+        else
+        {
+            // ponytail: resumes ALL locked targets on release; resuming only the
+            // highlighted one would need reading the switcher UI (UIA) - add if
+            // waking siblings on release ever matters.
+            ResumeSuspended("alt-tab released on target");
+        }
+    }
+
+    /// <summary>Suspends any currently-suspended-set target whose pid owns the
+    /// foreground window. Runs on the hook thread; takes StateLock briefly.</summary>
+    private static void SuspendForegroundTarget(string reason)
+    {
+        IntPtr fg = GetForegroundWindow();
+        if (fg == IntPtr.Zero) return;
+        uint fgPid;
+        GetWindowThreadProcessId(fg, out fgPid);
+        if (fgPid == 0) return;
+        lock (StateLock)
+        {
+            if (!Handles.ContainsKey((int)fgPid) || Suspended.Contains((int)fgPid)) return;
+            IntPtr h = Handles[(int)fgPid];
+            if (NtSuspendProcess(h) == 0)
+            {
+                Suspended.Add((int)fgPid);
+                Log("[SUSPEND] " + DescribeProcess((int)fgPid) + " (pid " + fgPid + ") - " + reason);
+            }
+        }
     }
 
     /// <summary>
@@ -1637,7 +1672,7 @@ public static class ProcessSuspenderApp
                 // Reopen handles lost to a stale-suspend failure so window-mode
                 // targets recover instead of going permanently inert.
                 if (!Handles.ContainsKey(pid)) OpenHandleLocked(pid);
-                bool focused = (int)fgPid == pid;
+                bool focused = (int)fgPid == pid && !kbdSwitching; // gesture: focus is about to move; never resume mid-gesture
                 if (ignoreMinimize && !focused) focused = IsIconic(t.Hwnd);
                 bool wasSuspended = Suspended.Contains(pid);
                 ApplyLocked(pid, focused, fgPid, holding);
@@ -1662,26 +1697,31 @@ public static class ProcessSuspenderApp
         foreach (int parentPid in childScans) SuspendChildrenOf(parentPid);
     }
 
-    // When the main window is suspended, also suspend its child worker processes
+    // When the main window is suspended, also suspend its descendant processes
     // (renderers, helpers) so they don't burn CPU while the parent is frozen.
-    // ponytail: depth-1 only (direct children); grandchildren are rare and the
-    // whitelist still protects named processes. Children that are never-suspend
-    // names are skipped by ApplyLocked's own guard.
-    // WMI is used for child enumeration (GetChildProcesses needs .NET 4.7.1,
+    // Walks the whole process tree (children, grandchildren, ...), not just
+    // depth-1. Never-suspend names stop the walk at that node. WMI is used for
+    // child enumeration (GetChildProcesses needs .NET 4.7.1,
     // this targets .NET 4.0). System.Management ships with the framework.
     private static void SuspendChildrenOf(int parentPid)
     {
+        SuspendDescendants(parentPid, new HashSet<int>());
+    }
+
+    private static void SuspendDescendants(int pid, HashSet<int> seen)
+    {
+        seen.Add(pid);
         var children = new List<uint>();
         try
         {
             using (var searcher = new System.Management.ManagementObjectSearcher(
-                "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + parentPid))
+                "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + pid))
             {
                 foreach (System.Management.ManagementObject mo in searcher.Get())
                 {
                     uint cidU;
                     if (!uint.TryParse(mo["ProcessId"].ToString(), out cidU)) continue;
-                    if (cidU == (uint)parentPid) continue;
+                    if (cidU == (uint)pid) continue;
                     children.Add(cidU);
                 }
             }
@@ -1691,17 +1731,20 @@ public static class ProcessSuspenderApp
         // WMI ran outside StateLock so input-hook resumptions never wait on a
         // slow query; only the apply pass takes the lock.
         int selfPid = Process.GetCurrentProcess().Id;
+        var next = new List<int>();
         lock (StateLock)
         {
             foreach (uint c in children)
             {
                 int cid = (int)c;
-                if (cid == selfPid) continue;
+                if (cid == selfPid || !seen.Add(cid)) continue;
                 if (IsNeverSuspendPid((uint)cid)) continue;
                 OpenHandleLocked(cid);
                 ApplyLocked(cid, false, 0, false);
+                next.Add(cid);
             }
         }
+        foreach (int cid in next) SuspendDescendants(cid, seen);
     }
 
     private static void TickNameMode()
@@ -1717,7 +1760,7 @@ public static class ProcessSuspenderApp
             foreach (int pid in Handles.Keys) NamePids.Add(pid);
             foreach (int pid in Handles.Keys.ToList())
             {
-                bool focused = fgPid != 0 && (int)fgPid == pid;
+                bool focused = fgPid != 0 && (int)fgPid == pid && !kbdSwitching; // same gesture guard as window mode
                 if (ignoreMinimize && !focused) focused = Minimized.Contains(pid);
                 ApplyLocked(pid, focused, fgPid, holding);
             }
@@ -1831,25 +1874,34 @@ public static class ProcessSuspenderApp
         Suspended.Remove(pid);
     }
 
-    // Resume + drop every child worker we suspended (see SuspendChildrenOf).
+    // Resume + drop every descendant we suspended (see SuspendChildrenOf).
     private static void DropChildrenOf(int parentPid)
     {
+        DropDescendants(parentPid, new HashSet<int>());
+    }
+
+    private static void DropDescendants(int pid, HashSet<int> seen)
+    {
+        seen.Add(pid);
+        var next = new List<uint>();
         try
         {
             using (var searcher = new System.Management.ManagementObjectSearcher(
-                "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + parentPid))
+                "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + pid))
             {
                 foreach (System.Management.ManagementObject mo in searcher.Get())
                 {
                     uint cidU;
                     if (!uint.TryParse(mo["ProcessId"].ToString(), out cidU)) continue;
                     int cid = (int)cidU;
-                    if (cid == parentPid) continue;
+                    if (cid == pid || !seen.Add(cid)) continue;
                     if (Handles.ContainsKey(cid)) DropHandleLocked(cid);
+                    next.Add(cidU);
                 }
             }
         }
-        catch { }
+        catch { return; }
+        foreach (uint c in next) DropDescendants((int)c, seen);
     }
 
     private static void DropAllHandlesLocked()
