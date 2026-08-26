@@ -23,6 +23,32 @@ public static class ProcessSuspenderApp
     private static extern int NtSuspendProcess(IntPtr h);
     [DllImport("ntdll.dll")]
     private static extern int NtResumeProcess(IntPtr h);
+    [DllImport("ntdll.dll")]
+    private static extern int NtQuerySystemInformation(int cls, IntPtr info, int length, out int returned);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+
+    // Prefix of the real record; Marshal.PtrToStructure only reads these bytes,
+    // so the trailing thread array we don't care about is never touched.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SYSTEM_PROCESS_INFORMATION
+    {
+        public uint NextEntryOffset;
+        public uint NumberOfThreads;
+        public long WorkingSetPrivateSize;
+        public uint HardFaultCount;
+        public uint NumberOfThreadsHighWatermark;
+        public long CycleTime;
+        public long CreateTime;
+        public long UserTime;
+        public long KernelTime;
+        public UNICODE_STRING ImageName;
+        public int BasePriority;
+        public IntPtr UniqueProcessId;
+        public IntPtr InheritedFromUniqueProcessId;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -1697,54 +1723,98 @@ public static class ProcessSuspenderApp
         foreach (int parentPid in childScans) SuspendChildrenOf(parentPid);
     }
 
-    // When the main window is suspended, also suspend its descendant processes
-    // (renderers, helpers) so they don't burn CPU while the parent is frozen.
-    // Walks the whole process tree (children, grandchildren, ...), not just
-    // depth-1. Never-suspend names stop the walk at that node. WMI is used for
-    // child enumeration (GetChildProcesses needs .NET 4.7.1,
-    // this targets .NET 4.0). System.Management ships with the framework.
-    private static void SuspendChildrenOf(int parentPid)
+    /// <summary>
+    /// One snapshot of every running process: pid, parent pid, exe name.
+    /// Replaces per-node WMI queries (~20-50 ms each) with a single
+    /// NtQuerySystemInformation call (&lt;1 ms). Returns null if it fails;
+    /// callers then skip that scan tick and retry next time.
+    /// </summary>
+    private static List<ProcInfo> SnapshotProcesses()
     {
-        SuspendDescendants(parentPid, new HashSet<int>());
-    }
-
-    private static void SuspendDescendants(int pid, HashSet<int> seen)
-    {
-        seen.Add(pid);
-        var children = new List<uint>();
+        int len = 1 << 20; // 1 MB start; grows if a busy system needs more
+        IntPtr buf = Marshal.AllocHGlobal(len);
         try
         {
-            using (var searcher = new System.Management.ManagementObjectSearcher(
-                "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + pid))
+            int returned;
+            while (NtQuerySystemInformation(5 /*SystemProcessInformation*/, buf, len, out returned) == unchecked((int)0xC0000004) /*STATUS_INFO_LENGTH_MISMATCH*/)
             {
-                foreach (System.Management.ManagementObject mo in searcher.Get())
-                {
-                    uint cidU;
-                    if (!uint.TryParse(mo["ProcessId"].ToString(), out cidU)) continue;
-                    if (cidU == (uint)pid) continue;
-                    children.Add(cidU);
-                }
+                Marshal.FreeHGlobal(buf);
+                len = Math.Max(returned, len * 2);
+                buf = Marshal.AllocHGlobal(len);
+                if (len > (64 << 20)) return null; // runaway: give up, retry next tick
             }
+            var list = new List<ProcInfo>(300);
+            IntPtr cur = buf;
+            while (true)
+            {
+                SYSTEM_PROCESS_INFORMATION p = (SYSTEM_PROCESS_INFORMATION)Marshal.PtrToStructure(cur, typeof(SYSTEM_PROCESS_INFORMATION));
+                string name = "";
+                if (p.ImageName.Buffer != IntPtr.Zero && p.ImageName.Length > 0)
+                    name = Marshal.PtrToStringUni(p.ImageName.Buffer, p.ImageName.Length / 2);
+                list.Add(new ProcInfo { Pid = (int)p.UniqueProcessId, Parent = (int)p.InheritedFromUniqueProcessId, Name = name });
+                if (p.NextEntryOffset == 0) break;
+                cur = new IntPtr(cur.ToInt64() + p.NextEntryOffset);
+            }
+            return list;
         }
-        catch { return; }
+        catch { return null; }
+        finally { Marshal.FreeHGlobal(buf); }
+    }
 
-        // WMI ran outside StateLock so input-hook resumptions never wait on a
-        // slow query; only the apply pass takes the lock.
-        int selfPid = Process.GetCurrentProcess().Id;
-        var next = new List<int>();
+    private class ProcInfo { public int Pid, Parent; public string Name; }
+
+    // Children of parentPid from the latest snapshot, or null when no snapshot.
+    private static HashSet<int> ChildPids(List<ProcInfo> snap, int parentPid)
+    {
+        var kids = new HashSet<int>();
+        foreach (ProcInfo p in snap)
+        {
+            if (p.Pid == parentPid || p.Parent != parentPid) continue;
+            kids.Add(p.Pid);
+        }
+        return kids;
+    }
+
+    // When the main window is suspended, also suspend its descendant processes
+    // (renderers, helpers) so they don't burn CPU while the parent is frozen.
+    // Walks the whole process tree (children, grandchildren, ...) using one
+    // NtQuerySystemInformation snapshot (see SnapshotProcesses) instead of a
+    // WMI query per node. Never-suspend names stop the walk at that node.
+    private static void SuspendChildrenOf(int parentPid)
+    {
+        var snap = SnapshotProcesses();
+        if (snap == null) return;
         lock (StateLock)
         {
-            foreach (uint c in children)
-            {
-                int cid = (int)c;
-                if (cid == selfPid || !seen.Add(cid)) continue;
-                if (IsNeverSuspendPid((uint)cid)) continue;
-                OpenHandleLocked(cid);
-                ApplyLocked(cid, false, 0, false);
-                next.Add(cid);
-            }
+            SuspendDescendants(parentPid, snap, new HashSet<int>());
         }
-        foreach (int cid in next) SuspendDescendants(cid, seen);
+    }
+
+    private static void SuspendDescendants(int pid, List<ProcInfo> snap, HashSet<int> seen)
+    {
+        seen.Add(pid);
+        int selfPid = Process.GetCurrentProcess().Id;
+        foreach (int cid in ChildPids(snap, pid))
+        {
+            if (cid == selfPid || !seen.Add(cid)) continue;
+            // Snapshot names are free; the old path paid a Process lookup per child.
+            if (IsNeverSuspendName(NameOf(snap, cid))) continue;
+            OpenHandleLocked(cid);
+            ApplyLocked(cid, false, 0, false);
+            SuspendDescendants(cid, snap, seen);
+        }
+    }
+
+    // Exe name from the snapshot (without ".exe"), "" when unknown.
+    private static string NameOf(List<ProcInfo> snap, int pid)
+    {
+        foreach (ProcInfo p in snap)
+        {
+            if (p.Pid != pid) continue;
+            string n = p.Name ?? "";
+            return n.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? n.Substring(0, n.Length - 4) : n;
+        }
+        return "";
     }
 
     private static void TickNameMode()
@@ -1877,31 +1947,23 @@ public static class ProcessSuspenderApp
     // Resume + drop every descendant we suspended (see SuspendChildrenOf).
     private static void DropChildrenOf(int parentPid)
     {
-        DropDescendants(parentPid, new HashSet<int>());
+        var snap = SnapshotProcesses();
+        if (snap == null) return;
+        lock (StateLock)
+        {
+            DropDescendants(parentPid, snap, new HashSet<int>());
+        }
     }
 
-    private static void DropDescendants(int pid, HashSet<int> seen)
+    private static void DropDescendants(int pid, List<ProcInfo> snap, HashSet<int> seen)
     {
         seen.Add(pid);
-        var next = new List<uint>();
-        try
+        foreach (int cid in ChildPids(snap, pid))
         {
-            using (var searcher = new System.Management.ManagementObjectSearcher(
-                "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + pid))
-            {
-                foreach (System.Management.ManagementObject mo in searcher.Get())
-                {
-                    uint cidU;
-                    if (!uint.TryParse(mo["ProcessId"].ToString(), out cidU)) continue;
-                    int cid = (int)cidU;
-                    if (cid == pid || !seen.Add(cid)) continue;
-                    if (Handles.ContainsKey(cid)) DropHandleLocked(cid);
-                    next.Add(cidU);
-                }
-            }
+            if (!seen.Add(cid)) continue;
+            if (Handles.ContainsKey(cid)) DropHandleLocked(cid);
+            DropDescendants(cid, snap, seen);
         }
-        catch { return; }
-        foreach (uint c in next) DropDescendants((int)c, seen);
     }
 
     private static void DropAllHandlesLocked()
