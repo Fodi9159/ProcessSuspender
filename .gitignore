@@ -4,3 +4,6 @@
 .firecrawl/
 .freebuff/
 .agents/
+
+# git worktree playgrounds (created by Hermes)
+.worktrees/
