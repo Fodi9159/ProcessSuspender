@@ -849,7 +849,8 @@ public static class ProcessSuspenderApp
             {
                 if (hit == t.Hwnd || IsChild(t.Hwnd, hit))
                 {
-                    if (IsBackdropClick(x, y, t.Hwnd)) return null;
+                    // ponytail: don't treat a suspended locked target visible behind
+                    // another window as backdrop — user clicking it wants it back.
                     return "click on target window";
                 }
             }
