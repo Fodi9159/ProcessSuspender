@@ -14,7 +14,13 @@ public static class ProcessSuspenderApp
 {
     private const uint PROCESS_SUSPEND_RESUME = 0x0800;
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-    private const uint PROCESS_ALL = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION;
+    private const uint PROCESS_SET_INFORMATION = 0x0200;
+    private const uint PROCESS_SET_QUOTA = 0x0100;
+    private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+    private const uint PROCESS_TERMINATE = 0x0001;
+    private const uint PROCESS_ECO_ACCESS = PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE;
+    private const uint PROCESS_ALL = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_ECO_ACCESS;
+    private const uint PROCESS_MINIMAL = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION;
     private const int LogCapacity = 500;
     private const int SwitchGestureTimeoutMs = 5000;
     private const int PostSwitchGraceMs = 500;
@@ -55,6 +61,49 @@ public static class ProcessSuspenderApp
     private static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder path, ref uint size);
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr h);
+    // ---- Eco / low-power mode ----
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetPriorityClass(IntPtr h, uint cls);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetPriorityClass(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessInformation(IntPtr h, int infoClass, ref POWER_THROTTLING_STATE info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOB_CPU_RATE_CONTROL info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+    [DllImport("psapi.dll", SetLastError = true)]
+    private static extern bool EmptyWorkingSet(IntPtr h);
+
+    private const uint IDLE_PRIORITY_CLASS = 0x0040;
+    private const uint NORMAL_PRIORITY_CLASS = 0x0020;
+    private const int ProcessPowerThrottling = 4;
+    private const uint POWER_THROTTLING_EXECUTION_SPEED = 0x1;
+    private const int JobObjectCpuRateControlInformation = 15;
+    private const uint CPU_RATE_ENABLE = 0x1;
+    private const uint CPU_RATE_HARD_CAP = 0x4;
+    private const uint JOB_OBJECT_SET_ATTRIBUTES = 0x0010;
+    // 10000 = 100%: the "no limit" rate written back on restore.
+    private const uint CPU_RATE_UNLIMITED = 10000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POWER_THROTTLING_STATE
+    {
+        public uint Version;
+        public uint ControlMask;
+        public uint StateMask;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOB_CPU_RATE_CONTROL
+    {
+        public uint ControlFlags;
+        public uint CpuRate;
+    }
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]
@@ -128,12 +177,34 @@ public static class ProcessSuspenderApp
 
     private static readonly object StateLock = new object();
     private static readonly Dictionary<int, IntPtr> Handles = new Dictionary<int, IntPtr>();
+    private static readonly Dictionary<int, DateTime> HandleStartTimes = new Dictionary<int, DateTime>();
     private static readonly HashSet<int> Suspended = new HashSet<int>();
+    private static readonly HashSet<int> Throttled = new HashSet<int>();
+    private static readonly Dictionary<int, uint> OrigPriority = new Dictionary<int, uint>();
+    private static readonly Dictionary<int, IntPtr> EcoJobs = new Dictionary<int, IntPtr>();
+    private static volatile bool ecoQoSUnsupported;
     private static readonly HashSet<int> Minimized = new HashSet<int>();
     private static readonly HashSet<int> WarnedPids = new HashSet<int>();
     private static readonly HashSet<int> WarnedResumePids = new HashSet<int>();
     private static readonly HashSet<int> FocusedNow = new HashSet<int>();
     private static uint lastFgPid;
+    private static DateTime lastNameRefresh = DateTime.MinValue;
+    private static DateTime lastWindowRefresh = DateTime.MinValue;
+    private static DateTime lastChildScan = DateTime.MinValue;
+    private static DateTime lastHookCache = DateTime.MinValue;
+    private static DateTime lastAudioRemute = DateTime.MinValue;
+    private static volatile bool pendingForegroundSuspend;
+    // Cheap hook cache refreshed by the worker: the mouse hook must never do
+    // Process enumeration or UIA walks (Windows drops slow low-level hooks).
+    private static readonly List<IntPtr> hookTargetHwnds = new List<IntPtr>();
+    private static readonly List<IntPtr> hookTargetMains = new List<IntPtr>();
+    // Normalized target identity for hook-safe taskbar matching (worker refreshes,
+    // hook only reads): exe file names + full paths lowercased with '/' separators,
+    // and lowercased trimmed window titles. Empty = unverifiable (fall back to resume).
+    private static readonly List<string> hookTargetExePaths = new List<string>();
+    private static readonly List<string> hookTargetTitles = new List<string>();
+    private static readonly object HookCacheLock = new object();
+    private static readonly object TaskbarLock = new object();
 
     // Explicitly-locked windows (Pick or Lock hotkey). Each is suspended when not foreground.
     private sealed class WindowTarget
@@ -174,9 +245,14 @@ public static class ProcessSuspenderApp
     // ("Taskbar.TaskListButtonAutomationPeer"). "Legacy" keeps the old behaviour
     // of treating the whole taskbar as a switch area on environments we cannot probe.
     private enum TrayMode { Unknown, Uia, Win32Button, Legacy }
-    private static TrayMode trayMode = TrayMode.Unknown;
+    private static volatile TrayMode trayMode = TrayMode.Unknown;
     private static readonly List<TrayButtonInfo> taskbarButtons = new List<TrayButtonInfo>();
     private static DateTime taskbarButtonsCached = DateTime.MinValue;
+    // True when the last button enumeration hit an error or found no taskbar, so
+    // the cache may be incomplete. The hook then falls back to resume-on-click
+    // (safer than leaving the game stuck) and logs the fallback reason.
+    private static volatile bool taskbarButtonsStale = true;
+    private static string lastTrayCacheLog = "";
 
     private sealed class TrayButtonInfo
     {
@@ -189,6 +265,7 @@ public static class ProcessSuspenderApp
 
     private static readonly List<string> LogBuffer = new List<string>();
     private static readonly object LogLock = new object();
+    private static readonly List<string> PendingFileLines = new List<string>();
     private static string logFilePath = "";
     private static bool logToFile = true;
 
@@ -205,31 +282,74 @@ public static class ProcessSuspenderApp
 
     public static int PollMs { get { return pollMs; } }
 
+    /// <summary>True when the configured freeze mode is Eco (low-power) instead of Suspend.</summary>
+    public static bool IsEcoMode()
+    {
+        try
+        {
+            if (Config == null || string.IsNullOrEmpty(Config.FreezeMode)) return false;
+            return Settings.NormalizeFreezeMode(Config.FreezeMode) == "Eco";
+        }
+        catch { return false; }
+    }
+
+    public static string FreezeModeLabel
+    {
+        get { return IsEcoMode() ? "Eco (low-power)" : "Suspend"; }
+    }
+
+    /// <summary>Switches the freeze mode and persists it. Takes effect on the next tick.</summary>
+    public static void SetFreezeMode(string mode)
+    {
+        if (Config == null) return;
+        string norm = Settings.NormalizeFreezeMode(mode);
+        if (Settings.NormalizeFreezeMode(Config.FreezeMode) == norm
+            && norm != "Eco") return;
+        // In Eco mode the CPU cap may have changed too, so always re-apply caps below.
+        Config.FreezeMode = norm;
+        try { SettingsStore.Save(Config); } catch { }
+        ApplyEcoCaps();
+        Log("[INFO] Freeze mode set to " + norm
+            + (norm == "Eco" ? " (low-power: IDLE + EcoQoS + " + Config.EcoCpuCapPercentClamped + "% CPU cap)" : " (NtSuspendProcess)"));
+        if (SettingsApplied != null) SettingsApplied();
+    }
+
+    private static bool IsFrozenLocked(int pid)
+    {
+        return Suspended.Contains(pid) || Throttled.Contains(pid);
+    }
+
     public static string CurrentTargetDescription
     {
         get
         {
+            string nameCopy;
+            IntPtr hwCopy = IntPtr.Zero;
+            uint pidCopy = 0;
+            int count;
             lock (StateLock)
             {
-                if (targetName != null)
-                {
-                    string title = FirstMatchingWindowTitle(targetName);
-                    string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
-                    return "process \"" + targetName + "\"" + extra;
-                }
-                if (WindowTargets.Count > 0)
-                {
-                    if (WindowTargets.Count == 1)
-                    {
-                        IntPtr hw = WindowTargets[0].Hwnd;
-                        string title = GetWindowTitle(hw);
-                        string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
-                        return DescribeProcess((int)WindowTargets[0].Pid) + extra + " (pid " + WindowTargets[0].Pid + ")";
-                    }
-                    return WindowTargets.Count + " locked windows";
-                }
-                return "none";
+                nameCopy = targetName;
+                count = WindowTargets.Count;
+                if (count == 1) { hwCopy = WindowTargets[0].Hwnd; pidCopy = WindowTargets[0].Pid; }
             }
+            if (nameCopy != null)
+            {
+                string title = FirstMatchingWindowTitle(nameCopy);
+                string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
+                return "process \"" + nameCopy + "\"" + extra;
+            }
+            if (count > 0)
+            {
+                if (count == 1)
+                {
+                    string title = GetWindowTitle(hwCopy);
+                    string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
+                    return DescribeProcess((int)pidCopy) + extra + " (pid " + pidCopy + ")";
+                }
+                return count + " locked windows";
+            }
+            return "none";
         }
     }
 
@@ -247,6 +367,7 @@ public static class ProcessSuspenderApp
                     foreach (int pid in NamePids)
                     {
                         if (Suspended.Contains(pid)) { state = "SUSPENDED"; break; }
+                        if (Throttled.Contains(pid)) { state = "THROTTLED (Eco)"; break; }
                     }
                     string title = FirstMatchingWindowTitle(targetName);
                     string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
@@ -255,10 +376,11 @@ public static class ProcessSuspenderApp
                 foreach (WindowTarget t in WindowTargets)
                 {
                     bool suspended = Suspended.Contains((int)t.Pid);
+                    bool throttled = Throttled.Contains((int)t.Pid);
                     string title = GetWindowTitle(t.Hwnd);
                     string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
-                    parts.Add(DescribeProcess((int)t.Pid) + extra + " (pid " + t.Pid + ") - "
-                        + (suspended ? "SUSPENDED" : "active"));
+                    string state = suspended ? "SUSPENDED" : (throttled ? "THROTTLED (Eco)" : "active");
+                    parts.Add(DescribeProcess((int)t.Pid) + extra + " (pid " + t.Pid + ") - " + state);
                 }
                 return string.Join("\r\n", parts.ToArray());
             }
@@ -271,25 +393,36 @@ public static class ProcessSuspenderApp
         public int Index;
         public string Label;
         public bool Suspended;
+        public bool Eco;
     }
 
     public static List<LockedEntry> GetLockedWindows()
     {
-        var result = new List<LockedEntry>();
+        var snapshot = new List<WindowTarget>();
+        var suspendedCopy = new HashSet<int>();
+        var throttledCopy = new HashSet<int>();
         lock (StateLock)
         {
-            for (int i = 0; i < WindowTargets.Count; i++)
+            foreach (WindowTarget t in WindowTargets) snapshot.Add(t);
+            foreach (int pid in Suspended) suspendedCopy.Add(pid);
+            foreach (int pid in Throttled) throttledCopy.Add(pid);
+        }
+        var result = new List<LockedEntry>();
+        for (int i = 0; i < snapshot.Count; i++)
+        {
+            WindowTarget t = snapshot[i];
+            string title = GetWindowTitle(t.Hwnd);
+            string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
+            bool isEco = throttledCopy.Contains((int)t.Pid);
+            bool frozen = suspendedCopy.Contains((int)t.Pid) || isEco;
+            result.Add(new LockedEntry
             {
-                WindowTarget t = WindowTargets[i];
-                string title = GetWindowTitle(t.Hwnd);
-                string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
-                result.Add(new LockedEntry
-                {
-                    Index = i,
-                    Label = DescribeProcess((int)t.Pid) + extra + " (pid " + t.Pid + ")",
-                    Suspended = Suspended.Contains((int)t.Pid)
-                });
-            }
+                Index = i,
+                Label = DescribeProcess((int)t.Pid) + extra + " (pid " + t.Pid + ")"
+                    + (isEco ? " [Eco]" : ""),
+                Suspended = frozen,
+                Eco = isEco
+            });
         }
         return result;
     }
@@ -300,13 +433,27 @@ public static class ProcessSuspenderApp
         {
             lock (StateLock)
             {
-                if (Suspended.Count == 0) return "running";
-                if (Suspended.Count == 1)
+                int frozen = Suspended.Count + Throttled.Count;
+                if (frozen == 0) return "running";
+                if (Suspended.Count > 0 && Throttled.Count == 0)
                 {
-                    foreach (int pid in Suspended)
-                        return "SUSPENDED (" + DescribeProcess(pid) + ")";
+                    if (Suspended.Count == 1)
+                    {
+                        foreach (int pid in Suspended)
+                            return "SUSPENDED (" + DescribeProcess(pid) + ")";
+                    }
+                    return "SUSPENDED (" + Suspended.Count + " processes)";
                 }
-                return "SUSPENDED (" + Suspended.Count + " processes)";
+                if (Throttled.Count > 0 && Suspended.Count == 0)
+                {
+                    if (Throttled.Count == 1)
+                    {
+                        foreach (int pid in Throttled)
+                            return "THROTTLED (Eco) (" + DescribeProcess(pid) + ")";
+                    }
+                    return "THROTTLED (Eco) (" + Throttled.Count + " processes)";
+                }
+                return "FROZEN (" + frozen + " processes)";
             }
         }
     }
@@ -315,12 +462,24 @@ public static class ProcessSuspenderApp
     {
         try
         {
-            foreach (Process p in Process.GetProcessesByName(name))
+            Process[] list = Process.GetProcessesByName(name);
+            try
             {
-                IntPtr mw = p.MainWindowHandle;
-                if (mw == IntPtr.Zero) continue;
-                string t = GetWindowTitle(mw);
-                if (t.Length > 0) return t;
+                foreach (Process p in list)
+                {
+                    try
+                    {
+                        IntPtr mw = p.MainWindowHandle;
+                        if (mw == IntPtr.Zero) continue;
+                        string t = GetWindowTitle(mw);
+                        if (t.Length > 0) return t;
+                    }
+                    finally { try { p.Dispose(); } catch { } }
+                }
+            }
+            finally
+            {
+                // individual Processes already disposed; array needs no dispose
             }
         }
         catch { }
@@ -338,72 +497,13 @@ public static class ProcessSuspenderApp
         return "";
     }
 
-    private static bool IsFullscreen(IntPtr hwnd)
-    {
-        if (hwnd == IntPtr.Zero) return false;
-        RECT r;
-        if (!GetWindowRect(hwnd, out r)) return false;
-        Screen sc = Screen.FromHandle(hwnd);
-        if (sc == null) return false;
-        var b = sc.Bounds;
-        const int tolerance = 8;
-        return r.Left <= b.Left + tolerance && r.Top <= b.Top + tolerance
-            && r.Right >= b.Right - tolerance && r.Bottom >= b.Bottom - tolerance
-            && r.Left >= b.Left - tolerance && r.Top >= b.Top - tolerance
-            && r.Right <= b.Right + tolerance && r.Bottom <= b.Bottom + tolerance;
-    }
-
-    // Core Windows processes used to classify a pid as "system" when its image
-    // path cannot be read (protected/elevated process). Never auto-lock these.
-    private static readonly HashSet<string> CoreSystemNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    { "system", "idle", "registry", "smss", "csrss", "wininit", "winlogon", "services",
-      "lsass", "svchost", "dwm", "fontdrvhost", "sihost", "explorer" };
-
-    private static bool IsSystemProcess(uint pid)
-    {
-        IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        if (h != IntPtr.Zero)
-        {
-            try
-            {
-                var sb = new StringBuilder(1024);
-                uint size = (uint)sb.Capacity;
-                // Limited query survives elevation where MainModule (needs more access) throws.
-                if (QueryFullProcessImageName(h, 0, sb, ref size))
-                    return sb.ToString(0, (int)size).StartsWith(Environment.GetEnvironmentVariable("SystemRoot") ?? @"C:\Windows", StringComparison.OrdinalIgnoreCase);
-            }
-            catch { }
-            finally { CloseHandle(h); }
-        }
-        try
-        {
-            return CoreSystemNames.Contains(Process.GetProcessById((int)pid).ProcessName);
-        }
-        catch { return true; }
-    }
-
-    private static IntPtr FindFullscreenWindow()
-    {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows(delegate(IntPtr hwnd, IntPtr lp)
-        {
-            if (!IsWindowVisible(hwnd)) return true;
-            uint pid;
-            GetWindowThreadProcessId(hwnd, out pid);
-            if (pid == 0 || pid == (uint)Process.GetCurrentProcess().Id) return true;
-            if (IsSystemProcess(pid)) return true;
-            if (!IsFullscreen(hwnd)) return true;
-            found = hwnd;
-            return false;
-        }, IntPtr.Zero);
-        return found;
-    }
-
     public static string LogFile { get { return logFilePath; } }
 
     public static void Initialize()
     {
         Config = SettingsStore.Load();
+        if (Config.NeverSuspend == null) Config.NeverSuspend = new List<string>();
+        if (Config.LockedProcesses == null) Config.LockedProcesses = new List<string>();
         logToFile = Config.LogToFile;
         pollMs = Config.PollIntervalMsClamped;
         logFilePath = Path.Combine(SettingsStore.ConfigDir, "focuslock.log");
@@ -422,7 +522,8 @@ public static class ProcessSuspenderApp
         worker.IsBackground = true;
         worker.Name = "ProcessSuspenderWorker";
         worker.Start();
-        Log("[INFO] ProcessSuspender started. Target: " + CurrentTargetDescription + ", poll: " + pollMs + "ms");
+        RestoreLockedProcesses();
+        Log("[INFO] ProcessSuspender started. Target: " + CurrentTargetDescription + ", poll: " + pollMs + "ms, mode: " + FreezeModeLabel);
     }
 
     public static void Stop()
@@ -438,15 +539,22 @@ public static class ProcessSuspenderApp
         {
             Log("[INFO] ProcessSuspender stopped (resume-on-exit disabled).");
         }
+        FlushLogToFile();
     }
 
     public static void ApplySettings()
     {
         if (Config == null) return;
+        Config.FreezeMode = Settings.NormalizeFreezeMode(Config.FreezeMode);
+        Config.Theme = AppTheme.NormalizeTheme(Config.Theme);
+        if (Config.EcoCpuCapPercent < 0.1 || Config.EcoCpuCapPercent > 100) Config.EcoCpuCapPercent = 2;
         pollMs = Config.PollIntervalMsClamped;
         logToFile = Config.LogToFile;
-        Log("[INFO] Settings applied: poll=" + pollMs + "ms, suspendWhenMinimized=" + Config.SuspendWhenMinimized
-            + ", resumeOnExit=" + Config.ResumeOnExit + ", logToFile=" + logToFile);
+        Log("[INFO] Settings applied: poll=" + pollMs + "ms, mode=" + FreezeModeLabel
+            + ", ecoCap=" + Config.EcoCpuCapPercentClamped + "%"
+            + ", suspendWhenMinimized=" + Config.SuspendWhenMinimized
+            + ", resumeOnExit=" + Config.ResumeOnExit + ", logToFile=" + logToFile
+            + ", theme=" + Config.Theme);
         if (!string.IsNullOrEmpty(Config.ProcessName))
         {
             string cur;
@@ -455,6 +563,7 @@ public static class ProcessSuspenderApp
                 SetTargetByName(Config.ProcessName);
         }
         ApplyNeverSuspendList();
+        ApplyEcoCaps();
         if (SettingsApplied != null) SettingsApplied();
     }
 
@@ -480,14 +589,148 @@ public static class ProcessSuspenderApp
                     }
                 }
             }
+            foreach (int pid in Throttled.ToList())
+            {
+                if (IsNeverSuspendPid((uint)pid))
+                {
+                    IntPtr h;
+                    if (Handles.TryGetValue(pid, out h))
+                    {
+                        RestoreEcoLocked(pid, h);
+                        Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid
+                            + ") - whitelisted in never-suspend list");
+                    }
+                }
+            }
             if (targetName != null && IsNeverSuspendName(targetName))
                 Log("[INFO] Target \"" + targetName
                     + "\" is in the never-suspend list - it will never be suspended.");
         }
     }
 
+    private static int SelfPid
+    {
+        get
+        {
+            try { return Process.GetCurrentProcess().Id; }
+            catch { return -1; }
+        }
+    }
+
+    private static bool IsSelfPid(uint pid)
+    {
+        try { return (uint)Process.GetCurrentProcess().Id == pid; }
+        catch { return false; }
+    }
+
+    private static string GetProcessName(int pid)
+    {
+        try
+        {
+            using (Process p = Process.GetProcessById(pid))
+                return p.ProcessName;
+        }
+        catch { return ""; }
+    }
+
+    private static DateTime GetProcessStartTime(int pid)
+    {
+        try
+        {
+            using (Process p = Process.GetProcessById(pid))
+                return p.StartTime;
+        }
+        catch { return DateTime.MinValue; }
+    }
+
+    /// <summary>True when the stored start-time no longer matches the live process (PID reused).</summary>
+    private static bool HasPidBeenReused(int pid)
+    {
+        DateTime stored;
+        lock (StateLock)
+        {
+            if (!HandleStartTimes.TryGetValue(pid, out stored)) return false;
+            if (stored == DateTime.MinValue) return false;
+        }
+        DateTime live = GetProcessStartTime(pid);
+        if (live == DateTime.MinValue) return false; // process gone or unreadable: let normal cleanup handle it
+        return live != stored;
+    }
+
+    private static void PersistLockedProcesses()
+    {
+        try
+        {
+            if (Config == null) return;
+            var names = new List<string>();
+            lock (StateLock)
+            {
+                foreach (WindowTarget t in WindowTargets)
+                {
+                    string n = GetProcessName((int)t.Pid);
+                    if (n.Length == 0) continue;
+                    bool dup = false;
+                    foreach (string e in names)
+                        if (e.Equals(n, StringComparison.OrdinalIgnoreCase)) { dup = true; break; }
+                    if (!dup) names.Add(n);
+                }
+                if (targetName != null) names.Clear(); // name-mode uses ProcessName, not this list
+            }
+            Config.LockedProcesses = names;
+            SettingsStore.Save(Config);
+        }
+        catch { }
+    }
+
+    private static void RestoreLockedProcesses()
+    {
+        List<string> saved = null;
+        try
+        {
+            if (Config != null && Config.LockedProcesses != null)
+                saved = new List<string>(Config.LockedProcesses);
+        }
+        catch { }
+        if (saved == null || saved.Count == 0) return;
+        lock (StateLock)
+        {
+            if (targetName != null || WindowTargets.Count > 0) return;
+        }
+        if (!string.IsNullOrEmpty(Config.ProcessName)) return;
+        foreach (string name in saved)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                if (IsNeverSuspendName(name)) continue;
+                if (name.Equals(Process.GetCurrentProcess().ProcessName, StringComparison.OrdinalIgnoreCase)) continue;
+                Process[] list = Process.GetProcessesByName(name);
+                try
+                {
+                    foreach (Process p in list)
+                    {
+                        try
+                        {
+                            if (p.MainWindowHandle != IntPtr.Zero)
+                            {
+                                AddTargetWindow(p.MainWindowHandle, (uint)p.Id);
+                                break;
+                            }
+                        }
+                        finally { try { p.Dispose(); } catch { } }
+                    }
+                }
+                finally { }
+            }
+            catch { }
+        }
+        if (WindowTargets.Count > 0)
+            Log("[INFO] Restored " + WindowTargets.Count + " locked window(s) from settings.");
+    }
+
     public static void SetTargetByName(string name)
     {
+        if (string.IsNullOrWhiteSpace(name)) return;
         if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             name = name.Substring(0, name.Length - 4);
         if (IsNeverSuspendName(name))
@@ -495,6 +738,15 @@ public static class ProcessSuspenderApp
             Log("[WARN] \"" + name + "\" is in the never-suspend list - not locking it.");
             return;
         }
+        try
+        {
+            if (name.Equals(Process.GetCurrentProcess().ProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                Log("[WARN] Cannot target ProcessSuspender itself - pick another window.");
+                return;
+            }
+        }
+        catch { }
         lock (StateLock)
         {
             DropAllHandlesLocked();
@@ -504,39 +756,23 @@ public static class ProcessSuspenderApp
             WindowTargets.Clear();
             Log("[INFO] Target set to process \"" + name + "\"");
         }
-        SaveLockedWindows();
-    }
-
-    public static void SetTargetWindow(IntPtr hwnd, uint pid)
-    {
-        if (IsNeverSuspendPid(pid))
-        {
-            Log("[WARN] \"" + DescribeProcess((int)pid) + "\" is in the never-suspend list - not locking it.");
-            return;
-        }
-        lock (StateLock)
-        {
-            targetName = null;
-            NamePids.Clear();
-            WindowTargets.Clear();
-            WindowTarget t = FindWindowTarget(hwnd);
-            if (t == null) { t = new WindowTarget(); WindowTargets.Add(t); }
-            t.Hwnd = hwnd;
-            t.Pid = pid;
-            OpenHandleLocked((int)pid);
-            Log("[INFO] Target locked onto " + DescribeProcess((int)pid) + " (pid " + pid + ")");
-        }
-        SaveLockedWindows();
     }
 
     /// <summary>Adds a window to the locked set without clearing the others (used by multi-select Pick).</summary>
     public static void AddTargetWindow(IntPtr hwnd, uint pid)
     {
+        if (hwnd == IntPtr.Zero || pid == 0) return;
+        if (IsSelfPid(pid))
+        {
+            Log("[WARN] Cannot lock ProcessSuspender itself - pick another window.");
+            return;
+        }
         if (IsNeverSuspendPid(pid))
         {
             Log("[WARN] \"" + DescribeProcess((int)pid) + "\" is in the never-suspend list - not locking it.");
             return;
         }
+        bool added = false;
         lock (StateLock)
         {
             if (FindWindowTarget(hwnd) != null) return;
@@ -546,19 +782,26 @@ public static class ProcessSuspenderApp
             WindowTargets.Add(t);
             OpenHandleLocked((int)pid);
             Log("[INFO] Added locked window " + DescribeProcess((int)pid) + " (pid " + pid + "). Total: " + WindowTargets.Count);
+            added = true;
         }
-        SaveLockedWindows();
+        if (added) PersistLockedProcesses();
     }
 
     /// <summary>Adds (or removes, if focused) the given window to the locked set. Returns a short result message.</summary>
     public static string ToggleWindowTarget(IntPtr hwnd, uint pid)
     {
+        if (IsSelfPid(pid))
+        {
+            Log("[WARN] Cannot lock ProcessSuspender itself - pick another window.");
+            return "Cannot lock ProcessSuspender itself";
+        }
         if (IsNeverSuspendPid(pid))
         {
             string proc = DescribeProcess((int)pid);
             Log("[WARN] \"" + proc + "\" is in the never-suspend list - not locking it.");
             return proc + " is in the never-suspend list - not locked";
         }
+        string result;
         lock (StateLock)
         {
             WindowTarget existing = FindWindowTarget(hwnd);
@@ -569,19 +812,22 @@ public static class ProcessSuspenderApp
                 if (existing.ChildrenLive) DropChildrenOf((int)existing.Pid);
                 string name = DescribeProcess((int)existing.Pid);
                 Log("[INFO] Unlocked " + name + " (pid " + existing.Pid + ").");
-                SaveLockedWindows();
-                return "Unlocked " + name;
+                result = "Unlocked " + name;
             }
-            targetName = null;
-            NamePids.Clear();
-            WindowTarget t = new WindowTarget { Hwnd = hwnd, Pid = pid };
-            WindowTargets.Add(t);
-            OpenHandleLocked((int)pid);
-            string name2 = DescribeProcess((int)pid);
-            Log("[INFO] Locked " + name2 + " (pid " + pid + "). Total locked: " + WindowTargets.Count);
-            SaveLockedWindows();
-            return "Locked " + name2;
+            else
+            {
+                targetName = null;
+                NamePids.Clear();
+                WindowTarget t = new WindowTarget { Hwnd = hwnd, Pid = pid };
+                WindowTargets.Add(t);
+                OpenHandleLocked((int)pid);
+                string name2 = DescribeProcess((int)pid);
+                Log("[INFO] Locked " + name2 + " (pid " + pid + "). Total locked: " + WindowTargets.Count);
+                result = "Locked " + name2;
+            }
         }
+        PersistLockedProcesses();
+        return result;
     }
 
     /// <summary>Locks the current foreground window into the set, or unlocks it if it is already locked.</summary>
@@ -605,6 +851,7 @@ public static class ProcessSuspenderApp
     /// <summary>Removes a locked window by index (used by the tray menu).</summary>
     public static void RemoveWindowTarget(int index)
     {
+        bool changed = false;
         lock (StateLock)
         {
             if (index < 0 || index >= WindowTargets.Count) return;
@@ -613,75 +860,9 @@ public static class ProcessSuspenderApp
             DropHandleLocked((int)t.Pid);
             DropChildrenOf((int)t.Pid);
             Log("[INFO] Unlocked " + DescribeProcess((int)t.Pid) + " (pid " + t.Pid + ") from tray.");
+            changed = true;
         }
-        SaveLockedWindows();
-    }
-
-    /// <summary>Re-locks windows saved in the config (called once at startup).</summary>
-    public static void RestoreLockedWindows()
-    {
-        if (Config == null || Config.LockedWindows == null) return;
-        foreach (LockedWindowEntry e in Config.LockedWindows)
-        {
-            IntPtr hwnd = FindMainWindowForPid((uint)e.Pid);
-            if (hwnd != IntPtr.Zero)
-            {
-                AddTargetWindow(hwnd, (uint)e.Pid);
-            }
-            else if (!string.IsNullOrWhiteSpace(e.ProcessName))
-            {
-                // pid gone (process restarted) -> recover by process name.
-                // ponytail: re-locks every instance with a visible window; child
-                // processes (mw=0) are skipped, so this stays bounded.
-                bool relocked = false;
-                foreach (Process p in Process.GetProcessesByName(e.ProcessName))
-                {
-                    IntPtr mw = p.MainWindowHandle;
-                    if (mw == IntPtr.Zero) continue;
-                    AddTargetWindow(mw, (uint)p.Id);
-                    relocked = true;
-                }
-                Log(relocked
-                    ? "[INFO] Saved locked window " + e.ProcessName + " (pid " + e.Pid + ") restarted - re-locked by name."
-                    : "[INFO] Saved locked window " + e.ProcessName + " (pid " + e.Pid + ") not running - skipped on restore.");
-            }
-            else
-            {
-                Log("[INFO] Saved locked window (pid " + e.Pid + ") not running - skipped on restore.");
-            }
-        }
-    }
-
-    /// <summary>Persists the current locked-window set (process name + pid) to the config.</summary>
-    public static void SaveLockedWindows()
-    {
-        if (Config == null) return;
-        lock (StateLock)
-        {
-            Config.LockedWindows = new List<LockedWindowEntry>();
-            foreach (WindowTarget t in WindowTargets)
-            {
-                string name = "";
-                try { name = Process.GetProcessById((int)t.Pid).ProcessName; } catch { }
-                Config.LockedWindows.Add(new LockedWindowEntry { ProcessName = name, Pid = (int)t.Pid });
-            }
-        }
-        SettingsStore.Save(Config);
-    }
-
-    private static IntPtr FindMainWindowForPid(uint pid)
-    {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows(delegate(IntPtr h, IntPtr lp)
-        {
-            uint p;
-            GetWindowThreadProcessId(h, out p);
-            if (p != pid) return true;
-            if (!IsWindowVisible(h)) return true;
-            found = h;
-            return false;
-        }, IntPtr.Zero);
-        return found;
+        if (changed) PersistLockedProcesses();
     }
 
     private static WindowTarget FindWindowTarget(IntPtr hwnd)
@@ -704,17 +885,29 @@ public static class ProcessSuspenderApp
                     Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ")");
                 }
             }
+            foreach (int pid in Throttled.ToList())
+            {
+                IntPtr h;
+                if (Handles.TryGetValue(pid, out h))
+                {
+                    RestoreEcoLocked(pid, h);
+                    Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ")");
+                }
+                else
+                {
+                    Throttled.Remove(pid);
+                    OrigPriority.Remove(pid);
+                }
+            }
         }
     }
 
     /// <summary>
-    /// The user pressed or released Alt+Tab (a real switch gesture, as detected by
-    /// the keyboard hook). Nothing is activated while the switcher is open - only
-    /// the highlight moves - so we stay quiet during the gesture and resume at
-    /// gesture END (Alt released): that is the moment Windows activates whichever
-    /// window is highlighted, and the hook sees the key-up before the shell does,
-    /// so the resume still lands before the activation attempt. Tabbing past the
-    /// target without releasing Alt on it therefore never wakes it.
+    /// The user pressed or released Alt+Tab / Win+Tab (a real switch gesture, as
+    /// detected by the keyboard hook). Resume on gesture END must stay synchronous
+    /// (the hook sees key-up before the shell activates, so resume lands first).
+    /// Suspend on gesture START is deferred to the worker: NtSuspend inside the
+    /// low-level hook would stall the switcher UI.
     /// </summary>
     public static void OnSwitchStateChanged(bool active)
     {
@@ -722,22 +915,17 @@ public static class ProcessSuspenderApp
         lastSwitchActivity = DateTime.UtcNow;
         if (active)
         {
-            // Gesture START while a locked target is foreground: suspend it right
-            // now instead of holding it for the whole gesture - alt-tabbing away
-            // means it is leaving focus, so freeze immediately.
-            SuspendForegroundTarget("alt-tab gesture started");
+            pendingForegroundSuspend = true;
         }
         else
         {
-            // ponytail: resumes ALL locked targets on release; resuming only the
-            // highlighted one would need reading the switcher UI (UIA) - add if
-            // waking siblings on release ever matters.
-            ResumeSuspended("alt-tab released on target");
+            pendingForegroundSuspend = false;
+            ResumeSuspended("switch gesture released");
         }
     }
 
-    /// <summary>Suspends any currently-suspended-set target whose pid owns the
-    /// foreground window. Runs on the hook thread; takes StateLock briefly.</summary>
+    /// <summary>Suspends (or Eco-throttles) any locked target that still owns the foreground window.
+    /// Runs on the worker thread (deferred from the keyboard hook).</summary>
     private static void SuspendForegroundTarget(string reason)
     {
         IntPtr fg = GetForegroundWindow();
@@ -745,46 +933,59 @@ public static class ProcessSuspenderApp
         uint fgPid;
         GetWindowThreadProcessId(fg, out fgPid);
         if (fgPid == 0) return;
+        if (IsSelfPid(fgPid)) return;
+        bool eco = IsEcoMode();
+        IntPtr h = IntPtr.Zero;
         lock (StateLock)
         {
-            if (!Handles.ContainsKey((int)fgPid) || Suspended.Contains((int)fgPid)) return;
-            IntPtr h = Handles[(int)fgPid];
-            if (NtSuspendProcess(h) == 0)
+            if (!Handles.ContainsKey((int)fgPid) || IsFrozenLocked((int)fgPid)) return;
+            h = Handles[(int)fgPid];
+        }
+        if (h == IntPtr.Zero) return;
+        if (IsNeverSuspendPid(fgPid)) return;
+        if (eco)
+        {
+            lock (StateLock)
             {
-                Suspended.Add((int)fgPid);
-                Log("[SUSPEND] " + DescribeProcess((int)fgPid) + " (pid " + fgPid + ") - " + reason);
+                if (!Handles.TryGetValue((int)fgPid, out h)) return;
+                if (IsFrozenLocked((int)fgPid)) return;
+                ApplyEcoLocked((int)fgPid, h);
             }
+            return;
+        }
+        if (NtSuspendProcess(h) == 0)
+        {
+            lock (StateLock) Suspended.Add((int)fgPid);
+            Log("[SUSPEND] " + DescribeProcess((int)fgPid) + " (pid " + fgPid + ") - " + reason);
         }
     }
 
     /// <summary>
-    /// Left mouse button down/up somewhere on screen. If the press is over the
-    /// taskbar (taskbar buttons activate on mouse-up, and a frozen game cannot be
-    /// activated) or directly over the target window, treat it as a window switch
-    /// attempt: resume the target so the click can activate it, and keep it running
-    /// for a short grace period after the matching mouse-up.
+    /// Left mouse button down/up. Fast path only: the low-level mouse hook must
+    /// return in microseconds (Windows drops slow hooks). No Process enumeration,
+    /// no UIA, no title matching here - just cached rects/handles. Only the
+    /// target's own taskbar button (or its window) resumes it; clicks elsewhere
+    /// are ignored so a suspended game stays frozen.
     /// </summary>
     public static void OnMouseSwitchEvent(bool down, int x, int y)
     {
         if (down)
         {
-            if (!IsAnySuspended())
+            bool anyFrozen;
+            lock (StateLock) anyFrozen = Suspended.Count + Throttled.Count > 0;
+            if (!anyFrozen)
             {
-                // Nothing to resume, but keep the hold alive through the physical
-                // press so the worker cannot freeze the target mid-gesture. Skip
-                // the expensive hit-testing (EnumWindows / UIA / process enum) -
-                // this runs inside the low-level mouse hook.
                 mouseSwitching = true;
                 mouseDownWasSwitch = false;
                 lastSwitchActivity = DateTime.UtcNow;
                 return;
             }
-            string reason = SwitchAreaReason(x, y);
-            mouseDownWasSwitch = reason != null;
-            if (!mouseDownWasSwitch) return;
+            bool isSwitch = CheapSwitchHit(x, y);
+            mouseDownWasSwitch = isSwitch;
+            if (!isSwitch) return;
             mouseSwitching = true;
             lastSwitchActivity = DateTime.UtcNow;
-            ResumeSuspended(reason);
+            ResumeSuspended("mouse click on target/taskbar");
             return;
         }
         mouseSwitching = false;
@@ -793,6 +994,310 @@ public static class ProcessSuspenderApp
             mouseDownWasSwitch = false;
             lastSwitchActivity = DateTime.UtcNow;
         }
+    }
+
+    /// <summary>Cheap hook-safe hit test using only cached data + WindowFromPoint.</summary>
+    private static bool CheapSwitchHit(int x, int y)
+    {
+        bool inTaskbar = false;
+        try { inTaskbar = IsInTaskbar(x, y); }
+        catch { inTaskbar = false; }
+        if (inTaskbar) return CheapTaskbarHit(x, y);
+        try
+        {
+            if (PointInsideForegroundWindow(x, y)) return false;
+        }
+        catch { }
+        IntPtr hit = IntPtr.Zero;
+        try { hit = WindowFromPoint(x, y); }
+        catch { return false; }
+        if (hit == IntPtr.Zero) return false;
+        lock (HookCacheLock)
+        {
+            foreach (IntPtr hw in hookTargetHwnds)
+            {
+                if (hit == hw) return true;
+                try { if (IsChild(hw, hit)) return true; }
+                catch { }
+            }
+            foreach (IntPtr mw in hookTargetMains)
+            {
+                if (hit == mw) return true;
+                try { if (IsChild(mw, hit)) return true; }
+                catch { }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Hook-safe taskbar hit test. Only a click on the target's own taskbar button
+    /// resumes it. Clicks on other apps' buttons, the tray, clock, Start, search or
+    /// empty gaps return false so a suspended game stays frozen. Uses only data the
+    /// worker cached (button rects + target exe/title); never touches Process or UIA.
+    /// When the environment cannot be probed (Legacy/Unknown mode), the button
+    /// cache is incomplete, or the target identity is unverifiable, returns true to
+    /// preserve the old resume-first behaviour and avoid a stuck suspended game.
+    /// Every verdict while suspended is logged (with its reason) so a wrong resume
+    /// can be traced in focuslock.log.
+    /// </summary>
+    private static bool CheapTaskbarHit(int x, int y)
+    {
+        if (trayMode == TrayMode.Legacy || trayMode == TrayMode.Unknown)
+        {
+            Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: tray mode " + trayMode + ")");
+            return true;
+        }
+        TrayButtonInfo hit = null;
+        int buttonCount = 0;
+        bool stale;
+        lock (taskbarButtons)
+        {
+            buttonCount = taskbarButtons.Count;
+            foreach (TrayButtonInfo b in taskbarButtons)
+            {
+                if (b.Contains(x, y)) { hit = b; break; }
+            }
+        }
+        stale = taskbarButtonsStale;
+        if (hit == null)
+        {
+            if (buttonCount == 0 || stale)
+            {
+                Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: buttons=" + buttonCount + ", stale=" + stale + ")");
+                return true; // enumeration failed or incomplete: cannot tell, resume to be safe
+            }
+            return false; // gap, tray, clock, Start, Search: never activates the target
+        }
+        List<string> exeList;
+        List<string> titleList;
+        lock (HookCacheLock)
+        {
+            exeList = new List<string>(hookTargetExePaths);
+            titleList = new List<string>(hookTargetTitles);
+        }
+        bool haveExe = exeList.Count > 0;
+        bool haveTitle = titleList.Count > 0;
+        if (!haveExe && !haveTitle)
+        {
+            Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: target identity unknown)");
+            return true; // target identity unknown: resume to be safe
+        }
+        string btnName = hit.Name ?? "";
+        string btnApp = hit.AppPath ?? "";
+        // (1) exe/AppId match. Most Win11 AutomationIds are opaque AppUserModelIds
+        // ("Chrome", "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App") rather than exe
+        // paths, so only a path-like AppId that fails to match is definitive proof
+        // of another app. An opaque AppId falls through to title matching; it is
+        // additionally compared against the target exe file name without extension
+        // ("Chrome" vs "chrome.exe").
+        if (haveExe && btnApp.Length > 0)
+        {
+            string p = StripAppidPrefix(btnApp).Replace('\\', '/').ToLowerInvariant();
+            if (p.Length > 0)
+            {
+                bool pathLike = p.Contains("/") || p.EndsWith(".exe", StringComparison.Ordinal);
+                bool matched = false;
+                foreach (string t in exeList)
+                {
+                    if (p == t) { matched = true; break; }
+                    int slash = t.LastIndexOf('/');
+                    string file = slash >= 0 ? t.Substring(slash + 1) : t;
+                    if (file.Length == 0) continue;
+                    if (p == file || p.EndsWith("/" + file, StringComparison.Ordinal)) { matched = true; break; }
+                    // opaque AppId vs "name.exe": compare without extension
+                    string noExt = file.EndsWith(".exe", StringComparison.Ordinal)
+                        ? file.Substring(0, file.Length - 4) : file;
+                    if (noExt.Length > 0 && (p == noExt || p.EndsWith("/" + noExt, StringComparison.Ordinal)))
+                    { matched = true; break; }
+                }
+                if (matched)
+                {
+                    Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume: target button (appid match \"" + Shorten(btnApp) + "\")");
+                    return true;
+                }
+                if (pathLike)
+                {
+                    Log("[MOUSE] taskbar click at (" + x + "," + y + ") ignored: other app button \"" + Shorten(btnName) + "\"");
+                    return false; // path AppId of a different app: definitely not ours
+                }
+                // opaque AppId with no exe-name match: undecided, try title below
+            }
+        }
+        // (2) title match, tolerant of clipped labels and Win10 suffixes
+        // (" - 1 running window", " pinned"). Prefix matching needs at least 3
+        // overlapping chars so short titles can't collide ("War" vs "Warframe").
+        if (haveTitle && btnName.Length > 0)
+        {
+            string n = StripButtonSuffixes(btnName).Trim().ToLowerInvariant();
+            if (n.Length > 0)
+            {
+                foreach (string t in titleList)
+                {
+                    if (t.Length == 0) continue;
+                    int overlap = Math.Min(n.Length, t.Length);
+                    if (overlap >= 3 && (n.StartsWith(t, StringComparison.Ordinal) || t.StartsWith(n, StringComparison.Ordinal)))
+                    {
+                        Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume: target button (title match \"" + Shorten(btnName) + "\")");
+                        return true;
+                    }
+                    if (n.Equals(t, StringComparison.Ordinal))
+                    {
+                        Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume: target button (title match \"" + Shorten(btnName) + "\")");
+                        return true;
+                    }
+                }
+                Log("[MOUSE] taskbar click at (" + x + "," + y + ") ignored: other app button \"" + Shorten(btnName) + "\"");
+                return false;
+            }
+        }
+        // Button could not be mapped (no AppPath, no usable name): treat as
+        // potential target so a click never leaves the game stuck suspended.
+        Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: unmappable button name=\"" + Shorten(btnName) + "\" appid=\"" + Shorten(btnApp) + "\")");
+        return true;
+    }
+
+    private static string Shorten(string s)
+    {
+        if (s == null) return "";
+        s = s.Trim();
+        return s.Length > 60 ? s.Substring(0, 60) + "..." : s;
+    }
+
+    /// <summary>Refreshed by the worker (not the hook): cheap cache for CheapSwitchHit.</summary>
+    private static void RefreshHookCache()
+    {
+        if ((DateTime.UtcNow - lastHookCache).TotalMilliseconds < 1000) return;
+        lastHookCache = DateTime.UtcNow;
+        try { RefreshTaskbarButtons(); } catch { }
+        List<IntPtr> hwnds = new List<IntPtr>();
+        List<IntPtr> mains = new List<IntPtr>();
+        string nameCopy = null;
+        List<WindowTarget> windowCopy = new List<WindowTarget>();
+        lock (StateLock)
+        {
+            foreach (WindowTarget t in WindowTargets) { hwnds.Add(t.Hwnd); windowCopy.Add(t); }
+            nameCopy = targetName;
+        }
+        if (nameCopy != null)
+        {
+            try
+            {
+                Process[] list = Process.GetProcessesByName(nameCopy);
+                foreach (Process p in list)
+                {
+                    try
+                    {
+                        if (p.MainWindowHandle != IntPtr.Zero)
+                            mains.Add(p.MainWindowHandle);
+                    }
+                    finally { try { p.Dispose(); } catch { } }
+                }
+            }
+            catch { }
+        }
+        lock (HookCacheLock)
+        {
+            hookTargetHwnds.Clear();
+            hookTargetHwnds.AddRange(hwnds);
+            hookTargetMains.Clear();
+            hookTargetMains.AddRange(mains);
+        }
+        try { RefreshHookIdentityCache(windowCopy, nameCopy); } catch { }
+    }
+
+    /// <summary>
+    /// Worker-only: snapshots the target's exe paths + window titles for the hook's
+    /// precise taskbar matching. Runs on the worker so the hook never touches
+    /// Process.MainModule or GetWindowText.
+    /// </summary>
+    private static void RefreshHookIdentityCache(List<WindowTarget> windowCopy, string nameCopy)
+    {
+        var exes = new List<string>();
+        var titles = new List<string>();
+        try
+        {
+            if (windowCopy != null && windowCopy.Count > 0)
+            {
+                foreach (WindowTarget t in windowCopy)
+                {
+                    try
+                    {
+                        using (Process p = Process.GetProcessById((int)t.Pid))
+                        {
+                            try
+                            {
+                                string f = p.MainModule.FileName;
+                                if (!string.IsNullOrEmpty(f))
+                                {
+                                    string norm = f.Replace('\\', '/').ToLowerInvariant();
+                                    if (!exes.Contains(norm)) exes.Add(norm);
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                    catch { }
+                    try
+                    {
+                        string title = GetWindowTitle(t.Hwnd);
+                        if (!string.IsNullOrEmpty(title))
+                        {
+                            string norm = title.Trim().ToLowerInvariant();
+                            if (norm.Length > 0 && !titles.Contains(norm)) titles.Add(norm);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            else if (nameCopy != null)
+            {
+                try
+                {
+                    Process[] list = Process.GetProcessesByName(nameCopy);
+                    foreach (Process p in list)
+                    {
+                        try
+                        {
+                            try
+                            {
+                                string f = p.MainModule.FileName;
+                                if (!string.IsNullOrEmpty(f))
+                                {
+                                    string norm = f.Replace('\\', '/').ToLowerInvariant();
+                                    if (!exes.Contains(norm)) exes.Add(norm);
+                                }
+                            }
+                            catch { }
+                            try
+                            {
+                                if (p.MainWindowHandle != IntPtr.Zero)
+                                {
+                                    string title = GetWindowTitle(p.MainWindowHandle);
+                                    if (!string.IsNullOrEmpty(title))
+                                    {
+                                        string norm = title.Trim().ToLowerInvariant();
+                                        if (norm.Length > 0 && !titles.Contains(norm)) titles.Add(norm);
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                        finally { try { p.Dispose(); } catch { } }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        lock (HookCacheLock)
+        {
+            hookTargetExePaths.Clear();
+            hookTargetExePaths.AddRange(exes);
+            hookTargetTitles.Clear();
+            hookTargetTitles.AddRange(titles);
+        }
+        try { LogTrayCache(); } catch { }
     }
 
     private static void ResumeSuspended(string reason)
@@ -807,6 +1312,55 @@ public static class ProcessSuspenderApp
                     Suspended.Remove(pid);
                     Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ") - " + reason);
                 }
+            }
+            foreach (int pid in Throttled.ToList())
+            {
+                IntPtr h;
+                if (Handles.TryGetValue(pid, out h))
+                {
+                    RestoreEcoLocked(pid, h);
+                    Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ") - " + reason);
+                }
+            }
+        }
+    }
+
+    /// <summary>Workstation locked (Win+L): freeze every locked target immediately.
+    /// The normal defocus poll would catch this on the next tick anyway, but the
+    /// explicit event is immediate and doesn't depend on what GetForegroundWindow
+    /// returns on the secure desktop. Unlock needs no handler - the worker resumes
+    /// on the next tick if the target is foreground again.</summary>
+    public static void OnSessionLocked()
+    {
+        bool eco = IsEcoMode();
+        List<int> pids;
+        lock (StateLock) pids = Handles.Keys.ToList();
+        foreach (int pid in pids)
+        {
+            if (IsSelfPid((uint)pid)) continue;
+            if (IsNeverSuspendPid((uint)pid)) continue;
+            IntPtr h = IntPtr.Zero;
+            lock (StateLock)
+            {
+                if (IsFrozenLocked(pid)) continue;
+                if (!Handles.TryGetValue(pid, out h)) continue;
+            }
+            if (h == IntPtr.Zero) continue;
+            if (eco)
+            {
+                lock (StateLock)
+                {
+                    IntPtr hh;
+                    if (!Handles.TryGetValue(pid, out hh)) continue;
+                    if (IsFrozenLocked(pid)) continue;
+                    ApplyEcoLocked(pid, hh);
+                }
+                continue;
+            }
+            if (NtSuspendProcess(h) == 0)
+            {
+                lock (StateLock) Suspended.Add(pid);
+                Log("[SUSPEND] " + DescribeProcess(pid) + " (pid " + pid + ") - workstation locked");
             }
         }
     }
@@ -862,16 +1416,21 @@ public static class ProcessSuspenderApp
         // launcher, a companion window) must not unfreeze the game.
         try
         {
-            foreach (Process p in Process.GetProcessesByName(name))
+            Process[] list = Process.GetProcessesByName(name);
+            foreach (Process p in list)
             {
-                IntPtr mw = p.MainWindowHandle;
-                if (mw == IntPtr.Zero) continue;
-                if (hit == mw || IsChild(mw, hit))
+                try
                 {
-                    if (!IsWindowVisible(hit)) return null;
-                    if (IsBackdropClick(x, y, mw)) return null;
-                    return "click on target window";
+                    IntPtr mw = p.MainWindowHandle;
+                    if (mw == IntPtr.Zero) continue;
+                    if (hit == mw || IsChild(mw, hit))
+                    {
+                        if (!IsWindowVisible(hit)) return null;
+                        if (IsBackdropClick(x, y, mw)) return null;
+                        return "click on target window";
+                    }
                 }
+                finally { try { p.Dispose(); } catch { } }
             }
         }
         catch { }
@@ -1065,25 +1624,38 @@ public static class ProcessSuspenderApp
         try
         {
             uint pid = 0;
+            string nameCopy = null;
             lock (StateLock)
             {
                 if (WindowTargets.Count > 0)
                     pid = WindowTargets[0].Pid;
                 else if (targetName != null)
+                    nameCopy = targetName;
+            }
+            if (nameCopy != null && pid == 0)
+            {
+                Process[] list = Process.GetProcessesByName(nameCopy);
+                foreach (Process p in list)
                 {
-                    foreach (Process p in Process.GetProcessesByName(targetName))
-                    { AddExePath(p); return targetExePaths.Count > 0; }
+                    try { AddExePath(p); }
+                    finally { try { p.Dispose(); } catch { } }
+                    if (targetExePaths.Count > 0) return true;
                 }
+                return targetExePaths.Count > 0;
             }
             if (pid != 0)
             {
                 using (Process p = Process.GetProcessById((int)pid))
                     AddExePath(p);
             }
-            else if (targetName != null)
+            else if (nameCopy != null)
             {
-                foreach (Process p in Process.GetProcessesByName(targetName))
-                    AddExePath(p);
+                Process[] list2 = Process.GetProcessesByName(nameCopy);
+                foreach (Process p in list2)
+                {
+                    try { AddExePath(p); }
+                    finally { try { p.Dispose(); } catch { } }
+                }
             }
         }
         catch { }
@@ -1141,19 +1713,25 @@ public static class ProcessSuspenderApp
     /// <summary>True when the pid belongs to the current target (window mode or process-name mode).</summary>
     private static bool IsTargetPid(uint pid)
     {
+        string nameCopy = null;
         lock (StateLock)
         {
             foreach (WindowTarget t in WindowTargets)
                 if (t.Pid == pid) return true;
-            if (targetName != null)
+            if (targetName != null) nameCopy = targetName;
+        }
+        if (nameCopy != null)
+        {
+            try
             {
-                try
+                Process[] list = Process.GetProcessesByName(nameCopy);
+                foreach (Process p in list)
                 {
-                    foreach (Process p in Process.GetProcessesByName(targetName))
-                        if ((uint)p.Id == pid) return true;
+                    try { if ((uint)p.Id == pid) return true; }
+                    finally { try { p.Dispose(); } catch { } }
                 }
-                catch { }
             }
+            catch { }
         }
         return false;
     }
@@ -1202,16 +1780,94 @@ public static class ProcessSuspenderApp
         return FindWindowEx(sw, IntPtr.Zero, "ToolbarWindow32", null);
     }
 
+    private static DateTime taskbarDetectAt = DateTime.MinValue;
+
     private static void RefreshTaskbarButtons()
     {
         if ((DateTime.UtcNow - taskbarButtonsCached).TotalMilliseconds < 400) return;
         taskbarButtonsCached = DateTime.UtcNow;
-        IntPtr tray = FindTaskbarWindow();
+        // Enumerate buttons on every taskbar (primary + secondary monitors): a
+        // click on another app's button on a secondary taskbar must be ignored too.
+        List<IntPtr> bars;
+        try { bars = EnumTaskbars(); }
+        catch { bars = null; }
+        if (bars == null || bars.Count == 0)
+        {
+            IntPtr single = IntPtr.Zero;
+            try { single = FindTaskbarWindow(); }
+            catch { }
+            bars = new List<IntPtr>();
+            if (single != IntPtr.Zero) bars.Add(single);
+        }
+        if (bars.Count == 0)
+        {
+            // Taskbar momentarily gone (Explorer restarting, fullscreen shell
+            // hiccup): keep the previously probed mode, mark stale so the hook
+            // resumes-first until the taskbar is back. Never latch Legacy here.
+            taskbarButtonsStale = true;
+            LogTrayCache();
+            return;
+        }
         lock (taskbarButtons) taskbarButtons.Clear();
-        if (tray == IntPtr.Zero) { trayMode = TrayMode.Legacy; return; }
-        if (trayMode == TrayMode.Unknown) trayMode = DetectTrayMode(tray);
-        if (trayMode == TrayMode.Uia) FillFromUia(tray);
-        else if (trayMode == TrayMode.Win32Button) FillFromWin32(tray);
+        bool failed = false;
+        // Re-probe while undecided (Unknown) or downgraded (Legacy): a single
+        // failed probe (taskbar busy, Explorer restarting) must not stick
+        // forever. Throttled to every 5s - the UIA walk is too heavy to run on
+        // every refresh.
+        if ((trayMode == TrayMode.Unknown || trayMode == TrayMode.Legacy)
+            && (DateTime.UtcNow - taskbarDetectAt).TotalSeconds >= 5)
+        {
+            taskbarDetectAt = DateTime.UtcNow;
+            TrayMode detected = TrayMode.Legacy;
+            foreach (IntPtr bar in bars)
+            {
+                try
+                {
+                    TrayMode m = DetectTrayMode(bar);
+                    if (m == TrayMode.Uia) { detected = TrayMode.Uia; break; }
+                    if (m == TrayMode.Win32Button) detected = TrayMode.Win32Button;
+                }
+                catch { }
+            }
+            if (detected != trayMode)
+                Log("[TASKBAR] tray mode re-probed: " + trayMode + " -> " + detected);
+            trayMode = detected;
+        }
+        if (trayMode == TrayMode.Uia || trayMode == TrayMode.Win32Button)
+        {
+            foreach (IntPtr bar in bars)
+            {
+                bool ok;
+                if (trayMode == TrayMode.Uia) ok = FillFromUia(bar);
+                else ok = FillFromWin32(bar);
+                if (!ok) failed = true;
+            }
+        }
+        else
+        {
+            failed = true; // Legacy: no buttons, hook keeps old resume-first behaviour
+        }
+        taskbarButtonsStale = failed;
+        LogTrayCache();
+    }
+
+    /// <summary>Logs tray mode / button / identity stats only when they change (worker thread).</summary>
+    private static void LogTrayCache()
+    {
+        try
+        {
+            int buttons, exes, titles;
+            lock (taskbarButtons) buttons = taskbarButtons.Count;
+            lock (HookCacheLock) { exes = hookTargetExePaths.Count; titles = hookTargetTitles.Count; }
+            string s = "trayMode=" + trayMode + " buttons=" + buttons + " stale=" + taskbarButtonsStale
+                + " targetExe=" + exes + " targetTitles=" + titles;
+            if (s != lastTrayCacheLog)
+            {
+                lastTrayCacheLog = s;
+                Log("[TASKBAR] " + s);
+            }
+        }
+        catch { }
     }
 
     private static TrayMode DetectTrayMode(IntPtr tray)
@@ -1237,7 +1893,9 @@ public static class ProcessSuspenderApp
 
     private static bool HasTaskListButtons(AutomationElement parent, TreeWalker walker)
     {
-        var el = walker.GetFirstChild(parent);
+        AutomationElement el;
+        try { el = walker.GetFirstChild(parent); }
+        catch { return false; }
         while (el != null)
         {
             try
@@ -1247,24 +1905,27 @@ public static class ProcessSuspenderApp
                 if (HasTaskListButtons(el, walker)) return true;
             }
             catch { }
-            el = walker.GetNextSibling(el);
+            try { el = walker.GetNextSibling(el); }
+            catch { return false; }
         }
         return false;
     }
 
-    private static void FillFromUia(IntPtr tray)
+    /// <summary>Fills taskbarButtons from one taskbar via UIA. Returns false when the walk failed.</summary>
+    private static bool FillFromUia(IntPtr tray)
     {
         try
         {
             AutomationElement root = AutomationElement.FromHandle(tray);
-            if (root == null) return;
+            if (root == null) return false;
             var walker = TreeWalker.ControlViewWalker;
             lock (taskbarButtons)
             {
                 FillUiaWalk(root, walker);
             }
+            return true;
         }
-        catch { lock (taskbarButtons) taskbarButtons.Clear(); }
+        catch { lock (taskbarButtons) taskbarButtons.Clear(); return false; }
     }
 
     private static void FillUiaWalk(AutomationElement parent, TreeWalker walker)
@@ -1299,24 +1960,29 @@ public static class ProcessSuspenderApp
         }
     }
 
-    private static void FillFromWin32(IntPtr tray)
+    private static bool FillFromWin32(IntPtr tray)
     {
-        foreach (IntPtr c in DescendantWindows(tray))
+        try
         {
-            var sb = new StringBuilder(128);
-            GetClassName(c, sb, sb.Capacity);
-            if (sb.ToString() != "TrayButton") continue;
-            RECT r;
-            if (!GetWindowRect(c, out r)) continue;
-            var tb = new StringBuilder(256);
-            GetWindowText(c, tb, tb.Capacity);
-            lock (taskbarButtons)
-                taskbarButtons.Add(new TrayButtonInfo
-                {
-                    Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Bottom,
-                    Name = tb.ToString()
-                });
+            foreach (IntPtr c in DescendantWindows(tray))
+            {
+                var sb = new StringBuilder(128);
+                GetClassName(c, sb, sb.Capacity);
+                if (sb.ToString() != "TrayButton") continue;
+                RECT r;
+                if (!GetWindowRect(c, out r)) continue;
+                var tb = new StringBuilder(256);
+                GetWindowText(c, tb, tb.Capacity);
+                lock (taskbarButtons)
+                    taskbarButtons.Add(new TrayButtonInfo
+                    {
+                        Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Bottom,
+                        Name = tb.ToString()
+                    });
+            }
+            return true;
         }
+        catch { return false; }
     }
 
     /// <summary>All descendant windows of root (breadth-first, DFS via stack).</summary>
@@ -1364,13 +2030,18 @@ public static class ProcessSuspenderApp
         {
             if (name != null)
             {
-                foreach (Process p in Process.GetProcessesByName(name))
+                Process[] list = Process.GetProcessesByName(name);
+                foreach (Process p in list)
                 {
-                    if (p.MainWindowHandle != IntPtr.Zero)
+                    try
                     {
-                        string t = GetWindowTitle(p.MainWindowHandle);
-                        if (t.Length > 0) return t;
+                        if (p.MainWindowHandle != IntPtr.Zero)
+                        {
+                            string t = GetWindowTitle(p.MainWindowHandle);
+                            if (t.Length > 0) return t;
+                        }
                     }
+                    finally { try { p.Dispose(); } catch { } }
                 }
                 return "";
             }
@@ -1393,27 +2064,34 @@ public static class ProcessSuspenderApp
     /// </summary>
     private static List<IntPtr> EnumTaskbars()
     {
-        if ((DateTime.UtcNow - taskbarWindowsAt).TotalMilliseconds >= 500)
+        lock (TaskbarLock)
+        {
+            if ((DateTime.UtcNow - taskbarWindowsAt).TotalMilliseconds < 500)
+                return new List<IntPtr>(taskbarWindows);
+        }
+        var fresh = new List<IntPtr>();
+        EnumWindows(delegate(IntPtr h, IntPtr l)
+        {
+            var sb = new StringBuilder(128);
+            GetClassName(h, sb, sb.Capacity);
+            string cls = sb.ToString();
+            for (int i = 0; i < TaskbarClassNames.Length; i++)
+            {
+                if (cls == TaskbarClassNames[i])
+                {
+                    fresh.Add(h);
+                    break;
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        lock (TaskbarLock)
         {
             taskbarWindowsAt = DateTime.UtcNow;
             taskbarWindows.Clear();
-            EnumWindows(delegate(IntPtr h, IntPtr l)
-            {
-                var sb = new StringBuilder(128);
-                GetClassName(h, sb, sb.Capacity);
-                string cls = sb.ToString();
-                for (int i = 0; i < TaskbarClassNames.Length; i++)
-                {
-                    if (cls == TaskbarClassNames[i])
-                    {
-                        taskbarWindows.Add(h);
-                        break;
-                    }
-                }
-                return true;
-            }, IntPtr.Zero);
+            taskbarWindows.AddRange(fresh);
+            return new List<IntPtr>(taskbarWindows);
         }
-        return taskbarWindows;
     }
 
     private static bool IsInTaskbar(int x, int y)
@@ -1444,7 +2122,7 @@ public static class ProcessSuspenderApp
             mouseDownWasSwitch = false;
             ResumeAll();
             FocusTargetWindow();
-            Log("[UNFREEZE] Suspend-on-defocus turned off - targets resumed.");
+            Log("[UNFREEZE] Freeze-on-defocus turned off - targets resumed.");
         }
         else
         {
@@ -1454,22 +2132,29 @@ public static class ProcessSuspenderApp
             kbdSwitching = false;
             mouseSwitching = false;
             mouseDownWasSwitch = false;
-            Log("[FREEZE] Suspend-on-defocus turned on.");
+            Log("[FREEZE] Freeze-on-defocus turned on (" + FreezeModeLabel + ").");
         }
     }
 
     private static void FocusTargetWindow()
     {
         IntPtr hwnd = IntPtr.Zero;
+        string nameCopy = null;
         lock (StateLock)
         {
             if (WindowTargets.Count > 0)
                 hwnd = WindowTargets[WindowTargets.Count - 1].Hwnd;
             else if (targetName != null)
+                nameCopy = targetName;
+        }
+        if (hwnd == IntPtr.Zero && nameCopy != null)
+        {
+            try
             {
-                try
+                Process[] list = Process.GetProcessesByName(nameCopy);
+                foreach (Process p in list)
                 {
-                    foreach (Process p in Process.GetProcessesByName(targetName))
+                    try
                     {
                         if (p.MainWindowHandle != IntPtr.Zero)
                         {
@@ -1477,9 +2162,10 @@ public static class ProcessSuspenderApp
                             break;
                         }
                     }
+                    finally { try { p.Dispose(); } catch { } }
                 }
-                catch { }
             }
+            catch { }
         }
         if (hwnd == IntPtr.Zero)
         {
@@ -1498,12 +2184,30 @@ public static class ProcessSuspenderApp
         {
             LogBuffer.Add(line);
             while (LogBuffer.Count > LogCapacity) LogBuffer.RemoveAt(0);
+            // Never do file I/O on the caller thread (hooks call Log): queue it,
+            // the worker flushes once per second.
             if (logToFile && logFilePath.Length > 0)
-            {
-                try { File.AppendAllText(logFilePath, line + "\r\n"); }
-                catch { }
-            }
+                PendingFileLines.Add(line);
+            if (PendingFileLines.Count > 2000)
+                PendingFileLines.RemoveRange(0, PendingFileLines.Count - 2000);
         }
+    }
+
+    private static void FlushLogToFile()
+    {
+        string[] pending = null;
+        lock (LogLock)
+        {
+            if (PendingFileLines.Count == 0) return;
+            pending = PendingFileLines.ToArray();
+            PendingFileLines.Clear();
+        }
+        try
+        {
+            if (logToFile && logFilePath.Length > 0)
+                File.AppendAllLines(logFilePath, pending);
+        }
+        catch { }
     }
 
     public static string[] GetLogLines()
@@ -1513,6 +2217,7 @@ public static class ProcessSuspenderApp
 
     private static void WorkerLoop()
     {
+        DateTime lastFlush = DateTime.UtcNow;
         int tick = 0;
         while (running)
         {
@@ -1527,8 +2232,14 @@ public static class ProcessSuspenderApp
                 try { Log("[WARN] Worker error: " + ex.Message); } catch { }
             }
             tick++;
+            if ((DateTime.UtcNow - lastFlush).TotalMilliseconds >= 1000)
+            {
+                lastFlush = DateTime.UtcNow;
+                try { FlushLogToFile(); } catch { }
+            }
             Thread.Sleep(pollMs);
         }
+        try { FlushLogToFile(); } catch { }
     }
 
     private static void RunWorkerTick(int tick)
@@ -1538,6 +2249,13 @@ public static class ProcessSuspenderApp
             ResumeAll();
             return;
         }
+
+        if (pendingForegroundSuspend)
+        {
+            pendingForegroundSuspend = false;
+            try { SuspendForegroundTarget("switch gesture started"); } catch { }
+        }
+        RefreshHookCache();
 
         uint fgPid = 0;
         IntPtr fg = GetForegroundWindow();
@@ -1549,76 +2267,95 @@ public static class ProcessSuspenderApp
                 + "), title=\"" + GetWindowTitle(fg) + "\"");
         }
 
-        lock (StateLock)
-        {
-            if (targetName == null && WindowTargets.Count == 0
-                && Config != null && Config.AutoLockFullscreen
-                && fgPid != 0 && fg != IntPtr.Zero)
-            {
-                IntPtr lockTarget = IntPtr.Zero;
-                uint lockPid = 0;
-                if (!IsSystemProcess(fgPid) && IsFullscreen(fg))
-                {
-                    lockTarget = fg;
-                    lockPid = fgPid;
-                }
-                else if (IsSystemProcess(fgPid))
-                {
-                    lockTarget = FindFullscreenWindow();
-                    if (lockTarget != IntPtr.Zero)
-                        GetWindowThreadProcessId(lockTarget, out lockPid);
-                }
-                if (lockTarget != IntPtr.Zero && lockPid != 0
-                    && lockPid != (uint)Process.GetCurrentProcess().Id
-                    && !IsNeverSuspendPid(lockPid))
-                    SetTargetWindow(lockTarget, lockPid);
-            }
-        }
-
+        DateTime now = DateTime.UtcNow;
         if (targetName != null)
         {
-            if (tick % 4 == 0) RefreshNameTargets();
+            if ((now - lastNameRefresh).TotalMilliseconds >= 1000)
+            {
+                lastNameRefresh = now;
+                RefreshNameTargets();
+            }
             TickNameMode();
         }
         else
         {
-            if (tick % 4 == 0) RefreshWindowTargets();
-            TickWindowMode(tick);
+            if ((now - lastWindowRefresh).TotalMilliseconds >= 1000)
+            {
+                lastWindowRefresh = now;
+                RefreshWindowTargets();
+                GcChildHandles();
+            }
+            TickWindowMode();
+        }
+        try { RemuteThrottledAudio(); } catch { }
+    }
+
+    /// <summary>Re-mutes throttled pids every ~5s: games can recreate their audio
+    /// session mid-throttle, which would come back unmuted. Idempotent.</summary>
+    private static void RemuteThrottledAudio()
+    {
+        if ((DateTime.UtcNow - lastAudioRemute).TotalMilliseconds < 5000) return;
+        lastAudioRemute = DateTime.UtcNow;
+        List<int> pids;
+        lock (StateLock)
+        {
+            if (Throttled.Count == 0) return;
+            pids = Throttled.ToList();
+        }
+        foreach (int pid in pids)
+        {
+            try { AudioMuter.SetPidMuted(pid, true); }
+            catch { }
         }
     }
 
     private static void RefreshNameTargets()
     {
-        List<Process> procs = new List<Process>();
+        if (targetName == null) return;
+        string nameCopy;
+        lock (StateLock) nameCopy = targetName;
+        if (nameCopy == null) return;
+        List<int> ids = new List<int>();
+        var minimizedNow = new HashSet<int>();
         try
         {
-            procs = Process.GetProcessesByName(targetName)
-                .Where(p => p.ProcessName.Equals(targetName, StringComparison.OrdinalIgnoreCase))
-                .ToList();
+            Process[] list = Process.GetProcessesByName(nameCopy);
+            foreach (Process p in list)
+            {
+                try
+                {
+                    if (!p.ProcessName.Equals(nameCopy, StringComparison.OrdinalIgnoreCase)) continue;
+                    ids.Add(p.Id);
+                    try
+                    {
+                        IntPtr mw = p.MainWindowHandle;
+                        if (mw != IntPtr.Zero && IsIconic(mw)) minimizedNow.Add(p.Id);
+                    }
+                    catch { }
+                }
+                finally { try { p.Dispose(); } catch { } }
+            }
         }
         catch { }
 
-        var alive = new HashSet<int>();
-        var minimizedNow = new HashSet<int>();
-        foreach (Process p in procs)
-        {
-            alive.Add(p.Id);
-            try
-            {
-                IntPtr mw = p.MainWindowHandle;
-                if (mw != IntPtr.Zero && IsIconic(mw)) minimizedNow.Add(p.Id);
-            }
-            catch { }
-        }
-
+        var alive = new HashSet<int>(ids);
         lock (StateLock)
         {
-            foreach (int pid in Handles.Keys.Where(pid => !alive.Contains(pid)).ToList())
-                DropHandleLocked(pid);
-            foreach (Process p in procs)
+            if (targetName == null || !targetName.Equals(nameCopy, StringComparison.OrdinalIgnoreCase)) return;
+            foreach (int pid in Handles.Keys.ToList())
             {
-                if (!Handles.ContainsKey(p.Id))
-                    OpenHandleLocked(p.Id);
+                if (!alive.Contains(pid))
+                    DropHandleLocked(pid);
+                else if (HasPidBeenReused(pid))
+                {
+                    Log("[WARN] pid " + pid + " was reused by a new process - reopening handle.");
+                    DropHandleLocked(pid);
+                }
+            }
+            foreach (int id in ids)
+            {
+                if (!Handles.ContainsKey(id))
+                    OpenHandleLocked(id);
             }
             Minimized.Clear();
             foreach (int pid in minimizedNow) Minimized.Add(pid);
@@ -1629,20 +2366,81 @@ public static class ProcessSuspenderApp
 
     private static void RefreshWindowTargets()
     {
+        List<WindowTarget> dead = new List<WindowTarget>();
         lock (StateLock)
         {
             for (int i = WindowTargets.Count - 1; i >= 0; i--)
             {
+                if (HasPidBeenReused((int)WindowTargets[i].Pid))
+                {
+                    WindowTarget reused = WindowTargets[i];
+                    Log("[WARN] Locked pid " + reused.Pid + " was reused - removing stale lock.");
+                    if (reused.ChildrenLive) DropChildrenOf((int)reused.Pid);
+                    WindowTargets.RemoveAt(i);
+                    DropHandleLocked((int)reused.Pid);
+                    continue;
+                }
                 if (!IsWindow(WindowTargets[i].Hwnd))
                 {
-                    WindowTarget dead = WindowTargets[i];
-                    Log("[WARN] Locked window closed: " + DescribeProcess((int)dead.Pid) + " (pid " + dead.Pid + "). Removed from locked set.");
-                    if (dead.ChildrenLive) DropChildrenOf((int)dead.Pid);
+                    dead.Add(WindowTargets[i]);
+                    WindowTarget d = WindowTargets[i];
+                    if (d.ChildrenLive) DropChildrenOf((int)d.Pid);
                     WindowTargets.RemoveAt(i);
-                    DropHandleLocked((int)dead.Pid);
+                    DropHandleLocked((int)d.Pid);
                 }
             }
         }
+        foreach (WindowTarget d in dead)
+            Log("[WARN] Locked window closed: " + DescribeProcess((int)d.Pid) + " (pid " + d.Pid + "). Removed from locked set.");
+        if (dead.Count > 0) PersistLockedProcesses();
+    }
+
+    /// <summary>Drops handles for exited child processes the tree walk no longer sees.</summary>
+    private static void GcChildHandles()
+    {
+        List<ProcInfo> snap = null;
+        try { snap = SnapshotProcesses(); } catch { return; }
+        if (snap == null) return;
+        var alive = new HashSet<int>();
+        foreach (ProcInfo p in snap) alive.Add(p.Pid);
+        List<int> parents = new List<int>();
+        lock (StateLock)
+        {
+            if (targetName != null) return; // name-mode handles are all top-level, refreshed separately
+            foreach (WindowTarget t in WindowTargets) parents.Add((int)t.Pid);
+        }
+        // valid = locked pids + all current descendants; anything else is a dead child leak
+        var keep = new HashSet<int>(parents);
+        var stack = new Stack<int>(parents);
+        var index = new Dictionary<int, List<int>>();
+        foreach (ProcInfo p in snap)
+        {
+            List<int> kids;
+            if (!index.TryGetValue(p.Parent, out kids)) { kids = new List<int>(); index[p.Parent] = kids; }
+            kids.Add(p.Pid);
+        }
+        while (stack.Count > 0)
+        {
+            int cur = stack.Pop();
+            List<int> kids;
+            if (!index.TryGetValue(cur, out kids)) continue;
+            foreach (int k in kids)
+            {
+                if (keep.Add(k)) stack.Push(k);
+            }
+        }
+        List<int> toDrop = new List<int>();
+        lock (StateLock)
+        {
+            foreach (int pid in Handles.Keys.ToList())
+            {
+                if (!alive.Contains(pid)) toDrop.Add(pid);
+                else if (!keep.Contains(pid) && WindowTargets.Count > 0) toDrop.Add(pid);
+            }
+            foreach (int pid in toDrop) DropHandleLocked(pid);
+        }
+        if (toDrop.Count > 0)
+            Log("[INFO] Cleaned up " + toDrop.Count + " exited helper process handle(s).");
     }
 
     /// <summary>FOCUSLOCK_TEST_FGPID is set by the test harness before launch; read once.</summary>
@@ -1683,13 +2481,15 @@ public static class ProcessSuspenderApp
         return fgPid;
     }
 
-    private static void TickWindowMode(int tick)
+    private static void TickWindowMode()
     {
         bool holding = ComputeHolding();
         uint fgPid = ResolveForegroundPid();
 
         bool ignoreMinimize = Config != null && !Config.SuspendWhenMinimized;
 
+        bool doChildScan = (DateTime.UtcNow - lastChildScan).TotalMilliseconds >= 2000;
+        if (doChildScan) lastChildScan = DateTime.UtcNow;
         List<int> childScans = new List<int>();
         lock (StateLock)
         {
@@ -1700,15 +2500,17 @@ public static class ProcessSuspenderApp
                 // targets recover instead of going permanently inert.
                 if (!Handles.ContainsKey(pid)) OpenHandleLocked(pid);
                 bool focused = (int)fgPid == pid && !kbdSwitching; // gesture: focus is about to move; never resume mid-gesture
-                if (ignoreMinimize && !focused) focused = IsIconic(t.Hwnd);
-                bool wasSuspended = Suspended.Contains(pid);
+                if (ignoreMinimize && !focused)
+                {
+                    try { if (IsIconic(t.Hwnd)) focused = true; } catch { }
+                }
+                bool wasSuspended = Suspended.Contains(pid) || Throttled.Contains(pid);
                 ApplyLocked(pid, focused, fgPid, holding);
                 if (!focused && !holding)
                 {
-                    // ponytail: WMI Win32_Process query is the heavy call; re-scan only
-                    // on the suspend transition or every 2s, never on every 250ms tick.
-                    // The query itself runs outside StateLock (see below).
-                    if (!wasSuspended || tick % 8 == 0)
+                    // Re-scan only on the suspend transition or every 2s, never on every tick.
+                    // The snapshot itself runs outside StateLock (see below).
+                    if (!wasSuspended || doChildScan)
                     {
                         childScans.Add(pid);
                         t.ChildrenLive = true;
@@ -1778,7 +2580,8 @@ public static class ProcessSuspenderApp
 
     // When the main window is suspended, also suspend its descendant processes
     // (renderers, helpers) so they don't burn CPU while the parent is frozen.
-    // Walks the whole process tree (children, grandchildren, ...) using one
+    // In Eco mode descendants are throttled instead. Walks the whole process
+    // tree (children, grandchildren, ...) using one
     // NtQuerySystemInformation snapshot (see SnapshotProcesses) instead of a
     // WMI query per node. Never-suspend names stop the walk at that node.
     private static void SuspendChildrenOf(int parentPid)
@@ -1825,6 +2628,10 @@ public static class ProcessSuspenderApp
 
         bool ignoreMinimize = Config != null && !Config.SuspendWhenMinimized;
 
+        bool doChildScan = (DateTime.UtcNow - lastChildScan).TotalMilliseconds >= 2000;
+        if (doChildScan) lastChildScan = DateTime.UtcNow;
+        List<int> toSuspendChildren = new List<int>();
+        List<int> toDropChildren = new List<int>();
         lock (StateLock)
         {
             NamePids.Clear();
@@ -1833,9 +2640,20 @@ public static class ProcessSuspenderApp
             {
                 bool focused = fgPid != 0 && (int)fgPid == pid && !kbdSwitching; // same gesture guard as window mode
                 if (ignoreMinimize && !focused) focused = Minimized.Contains(pid);
+                bool wasSuspended = Suspended.Contains(pid) || Throttled.Contains(pid);
                 ApplyLocked(pid, focused, fgPid, holding);
+                if (!focused && !holding)
+                {
+                    if (!wasSuspended || doChildScan) toSuspendChildren.Add(pid);
+                }
+                else if (focused)
+                {
+                    toDropChildren.Add(pid);
+                }
             }
         }
+        foreach (int pid in toSuspendChildren) SuspendChildrenOf(pid);
+        foreach (int pid in toDropChildren) DropChildrenOf(pid);
     }
 
     private static void ApplyLocked(int pid, bool focused, uint fgPid, bool hold)
@@ -1845,9 +2663,33 @@ public static class ProcessSuspenderApp
         if (!running) return;
         IntPtr h;
         if (!Handles.TryGetValue(pid, out h)) return;
+        bool eco = IsEcoMode();
         bool isSuspended = Suspended.Contains(pid);
+        bool isThrottled = Throttled.Contains(pid);
+        bool isFrozen = isSuspended || isThrottled;
 
-        if (focused && !isSuspended)
+        // Mode switch while unfocused: convert the old state to the new one.
+        // Focused always restores, regardless of mode.
+        if (eco && isSuspended)
+        {
+            if (ResumeFully(h))
+            {
+                Suspended.Remove(pid);
+                WarnedResumePids.Remove(pid);
+                isSuspended = false;
+                isFrozen = isThrottled;
+                Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ") - mode switched to Eco");
+            }
+        }
+        else if (!eco && isThrottled)
+        {
+            RestoreEcoLocked(pid, h);
+            isThrottled = false;
+            isFrozen = isSuspended;
+            Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ") - mode switched to Suspend");
+        }
+
+        if (focused && !isFrozen)
         {
             if (FocusedNow.Add(pid))
                 Log("[FOCUS] " + DescribeProcess(pid) + " (pid " + pid + ") focused (fg pid " + fgPid + ")");
@@ -1857,7 +2699,7 @@ public static class ProcessSuspenderApp
             FocusedNow.Remove(pid);
         }
 
-        if (!focused && !isSuspended && !hold)
+        if (!focused && !isFrozen && !hold)
         {
             if (IsNeverSuspendPid((uint)pid))
             {
@@ -1868,34 +2710,51 @@ public static class ProcessSuspenderApp
                         + ") is in the never-suspend list - skipping suspend.");
                 return;
             }
-            if (NtSuspendProcess(h) == 0)
+            if (IsSelfPid((uint)pid)) return;
+            if (eco)
             {
-                Suspended.Add(pid);
-                Log("[SUSPEND] " + DescribeProcess(pid) + " (pid " + pid + ")");
+                ApplyEcoLocked(pid, h);
             }
             else
             {
-                // Handle went stale (target restarting, access revoked). Close it so
-                // the next tick reopens fresh instead of dropping the lock target.
-                CloseHandle(h);
-                Handles.Remove(pid);
-                Suspended.Remove(pid);
-                WarnedPids.Remove(pid);
+                if (NtSuspendProcess(h) == 0)
+                {
+                    Suspended.Add(pid);
+                    Log("[SUSPEND] " + DescribeProcess(pid) + " (pid " + pid + ")");
+                }
+                else
+                {
+                    // Handle went stale (target restarting, access revoked). Close it so
+                    // the next tick reopens fresh instead of dropping the lock target.
+                    CloseHandle(h);
+                    Handles.Remove(pid);
+                    HandleStartTimes.Remove(pid);
+                    Suspended.Remove(pid);
+                    WarnedPids.Remove(pid);
+                }
             }
         }
-        else if (focused && isSuspended)
+        else if (focused && isFrozen)
         {
-            if (ResumeFully(h))
+            if (isSuspended)
             {
-                Suspended.Remove(pid);
-                WarnedResumePids.Remove(pid);
-                Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ")");
+                if (ResumeFully(h))
+                {
+                    Suspended.Remove(pid);
+                    WarnedResumePids.Remove(pid);
+                    Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ")");
+                }
+                else
+                {
+                    // keep the handle and retry on the next poll
+                    if (WarnedResumePids.Add(pid))
+                        Log("[WARN] Could not resume " + DescribeProcess(pid) + " (pid " + pid + ") - retrying.");
+                }
             }
-            else
+            if (isThrottled)
             {
-                // keep the handle and retry on the next poll
-                if (WarnedResumePids.Add(pid))
-                    Log("[WARN] Could not resume " + DescribeProcess(pid) + " (pid " + pid + ") - retrying.");
+                RestoreEcoLocked(pid, h);
+                Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ")");
             }
         }
     }
@@ -1915,9 +2774,397 @@ public static class ProcessSuspenderApp
         return true;
     }
 
+    // ---- Eco (low-power) implementation ----
+    // Caller must hold StateLock. Best-effort: IDLE priority + EcoQoS +
+    // Job CPU hard cap (1% floor). A pid is added to Throttled even when
+    // only part of the chain succeeded, so RestoreEcoLocked still runs
+    // on focus.
+
+    private static void ApplyEcoLocked(int pid, IntPtr h)
+    {
+        if (Throttled.Contains(pid)) return;
+        if (!OrigPriority.ContainsKey(pid))
+        {
+            uint orig = NORMAL_PRIORITY_CLASS;
+            try
+            {
+                uint cur = GetPriorityClass(h);
+                if (cur != 0) orig = cur;
+            }
+            catch { }
+            OrigPriority[pid] = orig;
+        }
+        try { SetPriorityClass(h, IDLE_PRIORITY_CLASS); }
+        catch { }
+        SetEcoQoS(h, true);
+        EnsureEcoJobLocked(pid, h);
+        Throttled.Add(pid);
+        double cap = Config != null ? Config.EcoCpuCapPercentClamped : 2.0;
+        Log("[THROTTLE] " + DescribeProcess(pid) + " (pid " + pid + ") - Eco low-power (IDLE + EcoQoS + " + cap + "% cap)");
+        AudioMuter.SetPidMuted(pid, true);
+    }
+
+    private static void RestoreEcoLocked(int pid, IntPtr h)
+    {
+        if (!Throttled.Contains(pid) && !OrigPriority.ContainsKey(pid) && !EcoJobs.ContainsKey(pid))
+            return;
+        SetEcoQoS(h, false);
+        uint orig = NORMAL_PRIORITY_CLASS;
+        if (OrigPriority.TryGetValue(pid, out orig) && orig == 0)
+            orig = NORMAL_PRIORITY_CLASS;
+        try { SetPriorityClass(h, orig); }
+        catch { }
+        // Lift the CPU cap explicitly: closing the job handle does NOT free
+        // the process (association lasts until the process exits), so the
+        // handle is kept for the next throttle cycle instead of closed.
+        IntPtr job;
+        if (EcoJobs.TryGetValue(pid, out job))
+            TrySetJobCap(job, CPU_RATE_UNLIMITED);
+        OrigPriority.Remove(pid);
+        Throttled.Remove(pid);
+        AudioMuter.SetPidMuted(pid, false);
+    }
+
+    private static void SetEcoQoS(IntPtr h, bool enable)
+    {
+        if (ecoQoSUnsupported) return;
+        try
+        {
+            POWER_THROTTLING_STATE st = new POWER_THROTTLING_STATE();
+            st.Version = 1;
+            st.ControlMask = POWER_THROTTLING_EXECUTION_SPEED;
+            st.StateMask = enable ? POWER_THROTTLING_EXECUTION_SPEED : 0;
+            SetProcessInformation(h, ProcessPowerThrottling, ref st, (uint)Marshal.SizeOf(typeof(POWER_THROTTLING_STATE)));
+        }
+        catch (EntryPointNotFoundException)
+        {
+            ecoQoSUnsupported = true;
+            Log("[WARN] EcoQoS not supported on this Windows version - using priority + CPU cap only.");
+        }
+        catch (DllNotFoundException)
+        {
+            ecoQoSUnsupported = true;
+        }
+        catch { }
+    }
+
+    /// <summary>Converts a percent cap (0.1-100) to a Job hard-cap rate (1-10000, 10000 = 100%).</summary>
+    private static uint CapToRate(double capPercent)
+    {
+        double rate = capPercent * 100.0;
+        if (rate < 1.0) rate = 1.0;
+        if (rate > 10000.0) rate = 10000.0;
+        return (uint)rate;
+    }
+
+    /// <summary>Per-pid Job name, so a new instance can reopen a stale capped job.</summary>
+    private static string EcoJobName(int pid)
+    {
+        return "ProcessSuspender_Eco_PID" + pid;
+    }
+
+    private static bool TrySetJobCap(IntPtr job, uint rate)
+    {
+        try
+        {
+            JOB_CPU_RATE_CONTROL info = new JOB_CPU_RATE_CONTROL();
+            info.ControlFlags = CPU_RATE_ENABLE | CPU_RATE_HARD_CAP;
+            info.CpuRate = rate;
+            return SetInformationJobObject(job, JobObjectCpuRateControlInformation, ref info, (uint)Marshal.SizeOf(typeof(JOB_CPU_RATE_CONTROL)));
+        }
+        catch { return false; }
+    }
+
+    private static void EnsureEcoJobLocked(int pid, IntPtr h)
+    {
+        double cap = Config != null ? Config.EcoCpuCapPercentClamped : 2.0;
+        IntPtr existing;
+        if (EcoJobs.TryGetValue(pid, out existing))
+        {
+            // Reuse the retained job (never nested deeper): just re-apply the cap.
+            TrySetJobCap(existing, CapToRate(cap));
+            return;
+        }
+        IntPtr job = IntPtr.Zero;
+        try
+        {
+            job = CreateJobObject(IntPtr.Zero, EcoJobName(pid));
+            if (job == IntPtr.Zero || job == new IntPtr(-1)) return;
+            if (!TrySetJobCap(job, CapToRate(cap)))
+            {
+                try { CloseHandle(job); }
+                catch { }
+                return;
+            }
+            if (!AssignProcessToJobObject(job, h))
+            {
+                // Already in another job (launcher) or access denied: keep EcoQoS +
+                // priority only. This is not fatal.
+                try { CloseHandle(job); }
+                catch { }
+                if (WarnedPids.Add(pid))
+                    Log("[WARN] Could not attach pid " + pid + " to CPU-cap job (already in a job?) - EcoQoS + priority only.");
+                return;
+            }
+            EcoJobs[pid] = job;
+        }
+        catch
+        {
+            if (job != IntPtr.Zero)
+            {
+                try { CloseHandle(job); }
+                catch { }
+            }
+        }
+    }
+
+    /// <summary>Re-applies the configured CPU cap to live Eco jobs (after a settings change).</summary>
+    private static void ApplyEcoCaps()
+    {
+        var copy = new List<KeyValuePair<int, IntPtr>>();
+        var limited = new HashSet<int>();
+        double cap = 2.0;
+        lock (StateLock)
+        {
+            if (Config != null) cap = Config.EcoCpuCapPercentClamped;
+            foreach (KeyValuePair<int, IntPtr> kv in EcoJobs)
+                copy.Add(kv);
+            foreach (int pid in Throttled)
+                limited.Add(pid);
+        }
+        uint limitedRate = CapToRate(cap);
+        foreach (KeyValuePair<int, IntPtr> kv in copy)
+        {
+            // Restored jobs are retained for reuse: keep them explicitly uncapped.
+            TrySetJobCap(kv.Value, limited.Contains(kv.Key) ? limitedRate : CPU_RATE_UNLIMITED);
+        }
+    }
+
+    // ---- Game audio auto-mute while Eco-throttled ----
+    // A 1-2% CPU cap starves the game loop, so its audio buffer refills in
+    // bursts: a split-second blip every few seconds. Muting the game's audio
+    // session on throttle (and unmuting on restore) removes it. Suspend mode
+    // needs none of this (a frozen process is silent). All COM GUIDs and
+    // vtable layouts below were verified at runtime against the local system
+    // (NAudio's declarations cross-checked); every call is best-effort and
+    // failures silently disable the mute for that tick, never the throttle.
+    private static class AudioMuter
+    {
+        [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+        private class MMDeviceEnumeratorCom { }
+
+        [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDeviceEnumerator
+        {
+            [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+            [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+        }
+
+        [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDevice
+        {
+            [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
+        }
+
+        [ComImport, Guid("F4B1A599-7266-4319-A8CA-E70ACB11E8CD"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionControl { }
+
+        [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionManager2
+        {
+            [PreserveSig] int GetAudioSessionControl(IntPtr sessionId, int flags, out IAudioSessionControl c);
+            [PreserveSig] int GetSimpleAudioVolume(IntPtr sessionId, int flags, out IntPtr v);
+            [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator e);
+            [PreserveSig] int RegisterSessionNotification(IntPtr n);
+            [PreserveSig] int UnregisterSessionNotification(IntPtr n);
+            [PreserveSig] int RegisterDuckNotification(IntPtr a, IntPtr b);
+            [PreserveSig] int UnregisterDuckNotification(IntPtr a);
+        }
+
+        [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionEnumerator
+        {
+            [PreserveSig] int GetCount(out int count);
+            [PreserveSig] int GetSession(int index, out IAudioSessionControl c);
+        }
+
+        [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionControl2
+        {
+            [PreserveSig] int P1(); [PreserveSig] int P2(); [PreserveSig] int P3();
+            [PreserveSig] int P4(); [PreserveSig] int P5(); [PreserveSig] int P6();
+            [PreserveSig] int P7(); [PreserveSig] int P8(); [PreserveSig] int P9();
+            [PreserveSig] int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string s);
+            [PreserveSig] int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string s);
+            [PreserveSig] int GetProcessId(out uint pid);
+        }
+
+        [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface ISimpleAudioVolume
+        {
+            [PreserveSig] int SetMasterVolume(float level, IntPtr ctx);
+            [PreserveSig] int GetMasterVolume(out float level);
+            [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, IntPtr ctx);
+            [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool muted);
+        }
+
+        private static readonly object MuteLock = new object();
+        private static readonly HashSet<int> MutedPids = new HashSet<int>();
+
+        private static void Release(object o)
+        {
+            try { if (o != null) Marshal.ReleaseComObject(o); }
+            catch { }
+        }
+
+        /// <summary>Mutes (or unmutes) every audio session owned by pid. Never throws.</summary>
+        public static void SetPidMuted(int pid, bool mute)
+        {
+            try
+            {
+                // Sessions can be recreated while throttled, so every call does
+                // a full pass; the per-session GetMute check keeps it idempotent.
+                lock (MuteLock) DoSetPidMuted(pid, mute);
+            }
+            catch { }
+        }
+
+        private static void DoSetPidMuted(int pid, bool mute)
+        {
+            bool changed = false;
+            try
+            {
+                IMMDeviceEnumerator enumerator = null;
+                try
+                {
+                    enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+                }
+                catch { return; }
+                try
+                {
+                    int[] roles = new int[] { 0, 1 }; // eConsole, eMultimedia
+                    foreach (int role in roles)
+                    {
+                        IMMDevice device = null;
+                        try
+                        {
+                            if (enumerator.GetDefaultAudioEndpoint(0, role, out device) != 0 || device == null)
+                                continue;
+                            Guid managerId = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+                            object managerObj = null;
+                            try
+                            {
+                                if (device.Activate(ref managerId, 23, IntPtr.Zero, out managerObj) != 0 || managerObj == null)
+                                    continue;
+                            }
+                            catch { continue; }
+                            IAudioSessionManager2 manager = null;
+                            try { manager = (IAudioSessionManager2)managerObj; }
+                            catch { Release(managerObj); continue; }
+                            try
+                            {
+                                IAudioSessionEnumerator sessionEnum = null;
+                                try
+                                {
+                                    if (manager.GetSessionEnumerator(out sessionEnum) != 0 || sessionEnum == null)
+                                        continue;
+                                }
+                                catch { continue; }
+                                try
+                                {
+                                    int count = 0;
+                                    try
+                                    {
+                                        if (sessionEnum.GetCount(out count) != 0) continue;
+                                    }
+                                    catch { continue; }
+                                    for (int i = 0; i < count; i++)
+                                    {
+                                        IAudioSessionControl session = null;
+                                        try
+                                        {
+                                            if (sessionEnum.GetSession(i, out session) != 0 || session == null)
+                                                continue;
+                                        }
+                                        catch { continue; }
+                                        try
+                                        {
+                                            IAudioSessionControl2 control2 = null;
+                                            try { control2 = (IAudioSessionControl2)session; }
+                                            catch { continue; }
+                                            try
+                                            {
+                                                uint sessionPid = 0;
+                                                try
+                                                {
+                                                    if (control2.GetProcessId(out sessionPid) != 0) continue;
+                                                }
+                                                catch { continue; }
+                                                if ((int)sessionPid != pid) continue;
+                                                ISimpleAudioVolume volume = null;
+                                                try { volume = (ISimpleAudioVolume)session; }
+                                                catch { continue; }
+                                                try
+                                                {
+                                                    bool isMuted = false;
+                                                    try
+                                                    {
+                                                        if (volume.GetMute(out isMuted) != 0) continue;
+                                                    }
+                                                    catch { continue; }
+                                                    if (isMuted == mute) continue;
+                                                    try
+                                                    {
+                                                        if (volume.SetMute(mute, IntPtr.Zero) != 0) continue;
+                                                    }
+                                                    catch { continue; }
+                                                    changed = true;
+                                                }
+                                                finally { Release(volume); }
+                                            }
+                                            finally { Release(control2); }
+                                        }
+                                        finally { Release(session); }
+                                    }
+                                }
+                                finally { Release(sessionEnum); }
+                            }
+                            finally { Release(manager); }
+                        }
+                        finally { Release(device); }
+                    }
+                }
+                finally { Release(enumerator); }
+            }
+            catch { return; }
+            if (mute && changed)
+            {
+                if (MutedPids.Add(pid))
+                    Log("[AUDIO] Muted " + DescribeProcess(pid) + " (pid " + pid + ") while Eco-throttled.");
+            }
+            else if (!mute && MutedPids.Contains(pid))
+            {
+                MutedPids.Remove(pid);
+                Log("[AUDIO] Unmuted " + DescribeProcess(pid) + " (pid " + pid + ") on restore.");
+            }
+        }
+    }
+
     private static void OpenHandleLocked(int pid)
     {
+        if (pid <= 0) return;
+        try
+        {
+            if (pid == Process.GetCurrentProcess().Id) return;
+        }
+        catch { }
         IntPtr h = OpenProcess(PROCESS_ALL, false, (uint)pid);
+        if (h == IntPtr.Zero)
+        {
+            // Expanded rights can fail on hardened processes where the old minimal
+            // mask still works (suspend-only). Fall back before giving up.
+            h = OpenProcess(PROCESS_MINIMAL, false, (uint)pid);
+        }
         if (h == IntPtr.Zero)
         {
             if (WarnedPids.Add(pid))
@@ -1925,10 +3172,33 @@ public static class ProcessSuspenderApp
             return;
         }
         Handles[pid] = h;
+        try { HandleStartTimes[pid] = GetProcessStartTime(pid); }
+        catch { HandleStartTimes[pid] = DateTime.MinValue; }
         // Blind cleanup: undo any stale suspension (e.g. a previous ProcessSuspender was killed
         // while the target was frozen, or it was suspended manually). ResumeFully also
         // clears accumulated suspend counts; resuming a running process is a safe no-op.
         ResumeFully(h);
+        // Blind cleanup for stale Eco attributes from a killed instance. Unlike the
+        // suspend count, a Job CPU cap survives our handle closing (the job lives
+        // as long as the process does), so reopen the named job and lift the cap.
+        // Games never run at IDLE themselves, so IDLE still means stale priority.
+        try { SetEcoQoS(h, false); } catch { }
+        try
+        {
+            IntPtr stale = OpenJobObject(JOB_OBJECT_SET_ATTRIBUTES, false, EcoJobName(pid));
+            if (stale != IntPtr.Zero && stale != new IntPtr(-1))
+            {
+                try { TrySetJobCap(stale, CPU_RATE_UNLIMITED); } catch { }
+                try { CloseHandle(stale); } catch { }
+            }
+        }
+        catch { }
+        try
+        {
+            uint cur = GetPriorityClass(h);
+            if (cur == IDLE_PRIORITY_CLASS) SetPriorityClass(h, NORMAL_PRIORITY_CLASS);
+        }
+        catch { }
     }
 
     private static void DropHandleLocked(int pid)
@@ -1936,13 +3206,24 @@ public static class ProcessSuspenderApp
         IntPtr h;
         if (Handles.TryGetValue(pid, out h))
         {
-            // Resume before closing the handle: closing a handle does NOT unsuspend
-            // the process, so an unlocked window would stay frozen otherwise.
+            // Resume/restore before closing the handle: closing a handle does NOT
+            // unsuspend the process, so an unlocked window would stay frozen otherwise.
             if (Suspended.Contains(pid)) ResumeFully(h);
+            if (Throttled.Contains(pid)) RestoreEcoLocked(pid, h);
             CloseHandle(h);
         }
         Handles.Remove(pid);
+        HandleStartTimes.Remove(pid);
         Suspended.Remove(pid);
+        Throttled.Remove(pid);
+        OrigPriority.Remove(pid);
+        IntPtr job;
+        if (EcoJobs.TryGetValue(pid, out job))
+        {
+            EcoJobs.Remove(pid);
+            try { CloseHandle(job); }
+            catch { }
+        }
     }
 
     // Resume + drop every descendant we suspended (see SuspendChildrenOf).
@@ -1975,11 +3256,22 @@ public static class ProcessSuspenderApp
             if (Handles.TryGetValue(pid, out h))
             {
                 if (Suspended.Contains(pid)) ResumeFully(h);
+                if (Throttled.Contains(pid)) RestoreEcoLocked(pid, h);
                 CloseHandle(h);
             }
             Handles.Remove(pid);
+            HandleStartTimes.Remove(pid);
+            OrigPriority.Remove(pid);
+            IntPtr job;
+            if (EcoJobs.TryGetValue(pid, out job))
+            {
+                EcoJobs.Remove(pid);
+                try { CloseHandle(job); }
+                catch { }
+            }
         }
         Suspended.Clear();
+        Throttled.Clear();
         WarnedResumePids.Clear();
     }
 
@@ -1987,7 +3279,8 @@ public static class ProcessSuspenderApp
     {
         try
         {
-            return Process.GetProcessById(pid).ProcessName;
+            using (Process p = Process.GetProcessById(pid))
+                return p.ProcessName;
         }
         catch
         {
@@ -2000,7 +3293,10 @@ public static class ProcessSuspenderApp
     {
         try
         {
-            return IsNeverSuspendName(Process.GetProcessById((int)pid).ProcessName);
+            string name;
+            using (Process p = Process.GetProcessById((int)pid))
+                name = p.ProcessName;
+            return IsNeverSuspendName(name);
         }
         catch { return false; }
     }
@@ -2053,8 +3349,6 @@ public static class Program
             if (!string.IsNullOrEmpty(name)) ProcessSuspenderApp.SetTargetByName(name);
 
             ProcessSuspenderApp.Start();
-
-            ProcessSuspenderApp.RestoreLockedWindows();
 
             if (pick)
             {

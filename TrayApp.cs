@@ -8,12 +8,17 @@ public class TrayApp : ApplicationContext
     private NotifyIcon _icon;
     private ToolStripMenuItem _miStatus;
     private ToolStripMenuItem _miFreeze;
-    private ToolStripMenuItem _miAutoLock;
     private ToolStripMenuItem _miLocked;
     private ToolStripMenuItem _miPoll125;
     private ToolStripMenuItem _miPoll250;
     private ToolStripMenuItem _miPoll500;
     private ToolStripMenuItem _miPoll1000;
+    private ToolStripMenuItem _miModeSuspend;
+    private ToolStripMenuItem _miModeEco;
+    private ToolStripMenuItem _miThemeSystem;
+    private ToolStripMenuItem _miThemeLight;
+    private ToolStripMenuItem _miThemeDark;
+    private ContextMenuStrip _menu;
     private SettingsForm _form;
     private Hotkeys _hotkeys;
     private InputHook _inputHook;
@@ -30,6 +35,8 @@ public class TrayApp : ApplicationContext
         _inputHook = new InputHook();
         _inputHook.SwitchStateChanged += delegate(bool active) { ProcessSuspenderApp.OnSwitchStateChanged(active); };
         _inputHook.MouseSwitchEvent += delegate(bool down, int x, int y) { ProcessSuspenderApp.OnMouseSwitchEvent(down, x, y); };
+        Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
+        try { Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged; } catch { }
 
         _icon = new NotifyIcon();
         _icon.Icon = BuildIcon();
@@ -42,6 +49,8 @@ public class TrayApp : ApplicationContext
         {
             if (_hotkeys != null) _hotkeys.Apply(ProcessSuspenderApp.Config);
             RefreshChecks();
+            ApplyMenuTheme();
+            try { if (_form != null && !_form.IsDisposed) _form.ApplyTheme(); } catch { }
         };
 
         if (showSettings) ShowSettings(false);
@@ -50,6 +59,7 @@ public class TrayApp : ApplicationContext
     private ContextMenuStrip BuildMenu()
     {
         var menu = new ContextMenuStrip();
+        _menu = menu;
         menu.Opening += delegate { RefreshChecks(); };
 
         _miStatus = new ToolStripMenuItem("Target: ...") { Enabled = false };
@@ -59,10 +69,6 @@ public class TrayApp : ApplicationContext
         _miFreeze = new ToolStripMenuItem("Enable/disable the app");
         _miFreeze.Click += delegate { ToggleFreeze(); };
         menu.Items.Add(_miFreeze);
-
-        _miAutoLock = new ToolStripMenuItem("Auto-lock fullscreen");
-        _miAutoLock.Click += delegate { ToggleAutoLock(); };
-        menu.Items.Add(_miAutoLock);
 
         var pickItem = new ToolStripMenuItem("Pick windows...");
         pickItem.Click += delegate
@@ -75,6 +81,11 @@ public class TrayApp : ApplicationContext
                 SettingsStore.Save(ProcessSuspenderApp.Config);
                 foreach (var kv in picks)
                 {
+                    if (IsSelfPid(kv.Value))
+                    {
+                        Toast.Show("Cannot lock ProcessSuspender itself.");
+                        continue;
+                    }
                     if (ProcessSuspenderApp.IsNeverSuspendPid(kv.Value))
                     {
                         Toast.Show(DescribePid(kv.Value) + " is in the never-suspend list - not locked.");
@@ -97,6 +108,27 @@ public class TrayApp : ApplicationContext
         _miPoll1000 = MakePollItem(poll, 1000);
         menu.Items.Add(poll);
 
+        var mode = new ToolStripMenuItem("Freeze mode");
+        _miModeSuspend = new ToolStripMenuItem("Suspend (0% CPU)");
+        _miModeSuspend.Click += delegate { SetFreezeMode("Suspend"); };
+        mode.DropDownItems.Add(_miModeSuspend);
+        _miModeEco = new ToolStripMenuItem("Eco low-power (game keeps running)");
+        _miModeEco.Click += delegate { SetFreezeMode("Eco"); };
+        mode.DropDownItems.Add(_miModeEco);
+        menu.Items.Add(mode);
+
+        var theme = new ToolStripMenuItem("Appearance");
+        _miThemeSystem = new ToolStripMenuItem("Follow Windows");
+        _miThemeSystem.Click += delegate { SetTheme("System"); };
+        theme.DropDownItems.Add(_miThemeSystem);
+        _miThemeLight = new ToolStripMenuItem("Light");
+        _miThemeLight.Click += delegate { SetTheme("Light"); };
+        theme.DropDownItems.Add(_miThemeLight);
+        _miThemeDark = new ToolStripMenuItem("Dark");
+        _miThemeDark.Click += delegate { SetTheme("Dark"); };
+        theme.DropDownItems.Add(_miThemeDark);
+        menu.Items.Add(theme);
+
         menu.Items.Add(new ToolStripSeparator());
 
         var settingsItem = new ToolStripMenuItem("Settings...");
@@ -117,6 +149,7 @@ public class TrayApp : ApplicationContext
         quitItem.Click += delegate { Quit(); };
         menu.Items.Add(quitItem);
 
+        ApplyMenuTheme();
         return menu;
     }
 
@@ -131,15 +164,24 @@ public class TrayApp : ApplicationContext
     private void RefreshChecks()
     {
         _miStatus.Text = "Target: " + ProcessSuspenderApp.CurrentTargetDescription
-                        + "  |  " + ProcessSuspenderApp.TargetStateDescription;
+                        + "  |  " + ProcessSuspenderApp.TargetStateDescription
+                        + "  |  " + ProcessSuspenderApp.FreezeModeLabel;
         _miFreeze.Checked = ProcessSuspenderApp.Enabled;
-        _miAutoLock.Checked = ProcessSuspenderApp.Config.AutoLockFullscreen;
         RefreshLockedMenu();
         int cur = ProcessSuspenderApp.Config.PollIntervalMsClamped;
         _miPoll125.Checked = cur == 125;
         _miPoll250.Checked = cur == 250;
         _miPoll500.Checked = cur == 500;
         _miPoll1000.Checked = cur == 1000;
+        bool eco = ProcessSuspenderApp.IsEcoMode();
+        _miModeSuspend.Checked = !eco;
+        _miModeEco.Checked = eco;
+        string theme = "System";
+        try { theme = AppTheme.NormalizeTheme(ProcessSuspenderApp.Config.Theme); } catch { }
+        if (_miThemeSystem != null) _miThemeSystem.Checked = theme == "System";
+        if (_miThemeLight != null) _miThemeLight.Checked = theme == "Light";
+        if (_miThemeDark != null) _miThemeDark.Checked = theme == "Dark";
+        ApplyMenuTheme();
     }
 
     private void RefreshLockedMenu()
@@ -153,7 +195,8 @@ public class TrayApp : ApplicationContext
         }
         foreach (ProcessSuspenderApp.LockedEntry e in entries)
         {
-            var mi = new ToolStripMenuItem((e.Suspended ? "⛔ " : "✅ ") + e.Label);
+            string icon = !e.Suspended ? "✅ " : (e.Eco ? "🐢 " : "⛔ ");
+            var mi = new ToolStripMenuItem(icon + e.Label);
             int idx = e.Index;
             mi.Click += delegate { ProcessSuspenderApp.RemoveWindowTarget(idx); };
             _miLocked.DropDownItems.Add(mi);
@@ -162,8 +205,45 @@ public class TrayApp : ApplicationContext
 
     private static string DescribePid(uint pid)
     {
-        try { return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; }
+        try { using (System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById((int)pid)) return p.ProcessName; }
         catch { return pid.ToString(); }
+    }
+
+    private static bool IsSelfPid(uint pid)
+    {
+        try { return (uint)System.Diagnostics.Process.GetCurrentProcess().Id == pid; }
+        catch { return false; }
+    }
+
+    private void OnSessionSwitch(object sender, Microsoft.Win32.SessionSwitchEventArgs e)
+    {
+        if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLock)
+            ProcessSuspenderApp.OnSessionLocked();
+    }
+
+    private void OnUserPreferenceChanged(object sender, Microsoft.Win32.UserPreferenceChangedEventArgs e)
+    {
+        try
+        {
+            // Windows theme change: re-apply only when following the system.
+            string theme = "System";
+            try { theme = AppTheme.NormalizeTheme(ProcessSuspenderApp.Config.Theme); } catch { }
+            if (theme != "System") return;
+            ApplyMenuTheme();
+            try { if (_form != null && !_form.IsDisposed) _form.ApplyTheme(); } catch { }
+        }
+        catch { }
+    }
+
+    private void ApplyMenuTheme()
+    {
+        try
+        {
+            if (_menu == null) return;
+            bool dark = AppTheme.IsDark(ProcessSuspenderApp.Config);
+            AppTheme.ApplyMenu(_menu, dark);
+        }
+        catch { }
     }
 
     private void ToggleFreeze()
@@ -172,18 +252,31 @@ public class TrayApp : ApplicationContext
         RefreshChecks();
     }
 
-    private void ToggleAutoLock()
-    {
-        ProcessSuspenderApp.Config.AutoLockFullscreen = !ProcessSuspenderApp.Config.AutoLockFullscreen;
-        SettingsStore.Save(ProcessSuspenderApp.Config);
-        RefreshChecks();
-    }
-
     private void SetPoll(int ms)
     {
         ProcessSuspenderApp.Config.PollIntervalMs = ms;
         SettingsStore.Save(ProcessSuspenderApp.Config);
         ProcessSuspenderApp.ApplySettings();
+    }
+
+    private void SetFreezeMode(string mode)
+    {
+        ProcessSuspenderApp.SetFreezeMode(mode);
+        RefreshChecks();
+    }
+
+    private void SetTheme(string theme)
+    {
+        try
+        {
+            ProcessSuspenderApp.Config.Theme = AppTheme.NormalizeTheme(theme);
+            SettingsStore.Save(ProcessSuspenderApp.Config);
+            ProcessSuspenderApp.ApplySettings();
+            ApplyMenuTheme();
+            try { if (_form != null && !_form.IsDisposed) _form.ApplyTheme(); } catch { }
+            RefreshChecks();
+        }
+        catch { }
     }
 
     private void ShowSettings(bool logTab)
@@ -202,6 +295,7 @@ public class TrayApp : ApplicationContext
             _form.Show();
             _form.Activate();
         }
+        try { _form.ApplyTheme(); } catch { }
         if (logTab) _form.ShowLogTab();
     }
 
@@ -213,6 +307,8 @@ public class TrayApp : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        try { Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch; } catch { }
+        try { Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged; } catch { }
         _icon.Visible = false;
         if (_icon != null) _icon.Dispose();
         if (_hotkeys != null) _hotkeys.Dispose();

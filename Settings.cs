@@ -9,54 +9,74 @@ public class Settings
     public string ProcessName { get; set; }
     public int PollIntervalMs { get; set; }
     public bool SuspendWhenMinimized { get; set; }
+    /// <summary>
+    /// How to quiet the target on defocus: "Suspend" (NtSuspendProcess, ~0% CPU)
+    /// or "Eco" (low-power: IDLE priority + EcoQoS + CPU cap, game keeps running).
+    /// </summary>
+    public string FreezeMode { get; set; }
+    /// <summary>CPU hard cap percent (0.1-100) applied in Eco mode via a Job Object.</summary>
+    public double EcoCpuCapPercent { get; set; }
     public bool ResumeOnExit { get; set; }
     public bool AutoStartWithWindows { get; set; }
     public bool LogToFile { get; set; }
     public string LockHotkey { get; set; }
     public string FreezeHotkey { get; set; }
-    public bool AutoLockFullscreen { get; set; }
+    /// <summary>
+    /// UI theme: "System" (follow Windows), "Light" or "Dark".
+    /// </summary>
+    public string Theme { get; set; }
     /// <summary>
     /// Process names that must never be locked or suspended (case-insensitive,
     /// no ".exe" extension needed). Also covers services by their host process
     /// name (e.g. "svchost"). Explorer is whitelisted by default.
     /// </summary>
     public List<string> NeverSuspend { get; set; }
+    /// <summary>
+    /// Process names of locked windows, saved so they survive a restart.
+    /// HWNDs/PIDs cannot be saved (they change every run), so on startup
+    /// we re-lock the main window of each name that is still running.
+    /// </summary>
+    public List<string> LockedProcesses { get; set; }
     // legacy keys from older config files - only used for migration in Load()
     public string ToggleHotkey { get; set; }
-
-    /// <summary>
-    /// Windows locked (Pick / Lock hotkey) that are restored on the next launch.
-    /// Stored by process name + pid so the live window can be re-found after a restart.
-    /// </summary>
-    public List<LockedWindowEntry> LockedWindows { get; set; }
 
     public Settings()
     {
         ProcessName = "";
         PollIntervalMs = 250;
         SuspendWhenMinimized = true;
+        FreezeMode = "Suspend";
+        EcoCpuCapPercent = 2;
         ResumeOnExit = true;
         AutoStartWithWindows = false;
         LogToFile = true;
         LockHotkey = "Ctrl+Alt+F9";
         FreezeHotkey = "Ctrl+Alt+F10";
-        AutoLockFullscreen = true;
+        Theme = "System";
         NeverSuspend = new List<string>();
         NeverSuspend.Add("explorer");
-        LockedWindows = new List<LockedWindowEntry>();
+        LockedProcesses = new List<string>();
     }
 
     public int PollIntervalMsClamped
     {
         get { return Math.Max(125, Math.Min(2000, PollIntervalMs)); }
     }
-}
 
-/// <summary>Serializable record of a locked window for persistence across restarts.</summary>
-public class LockedWindowEntry
-{
-    public string ProcessName { get; set; }
-    public int Pid { get; set; }
+    public double EcoCpuCapPercentClamped
+    {
+        get { return Math.Max(0.1, Math.Min(100.0, EcoCpuCapPercent)); }
+    }
+
+    /// <summary>Canonicalizes the freeze mode string from config ("Eco" or "Suspend").</summary>
+    public static string NormalizeFreezeMode(string mode)
+    {
+        if (string.IsNullOrWhiteSpace(mode)) return "Suspend";
+        string m = mode.Trim().ToLowerInvariant();
+        if (m == "eco" || m == "lowpower" || m == "low-power" || m == "low_power" || m == "ecoqos")
+            return "Eco";
+        return "Suspend";
+    }
 }
 
 public static class SettingsStore
@@ -97,7 +117,12 @@ public static class SettingsStore
                     if (string.IsNullOrWhiteSpace(s.LockHotkey)) s.LockHotkey = "Ctrl+Alt+F9";
                     if (!raw.Contains("\"FreezeHotkey\"") || string.IsNullOrWhiteSpace(s.FreezeHotkey))
                         s.FreezeHotkey = string.IsNullOrWhiteSpace(s.ToggleHotkey) ? "Ctrl+Alt+F10" : s.ToggleHotkey;
-                    if (s.LockedWindows == null) s.LockedWindows = new List<LockedWindowEntry>();
+                    if (s.NeverSuspend == null) s.NeverSuspend = new List<string>();
+                    if (s.LockedProcesses == null) s.LockedProcesses = new List<string>();
+                    if (string.IsNullOrEmpty(s.ProcessName)) s.ProcessName = "";
+                    s.FreezeMode = Settings.NormalizeFreezeMode(s.FreezeMode);
+                    s.Theme = AppTheme.NormalizeTheme(s.Theme);
+                    if (s.EcoCpuCapPercent < 0.1 || s.EcoCpuCapPercent > 100) s.EcoCpuCapPercent = 2;
                     return s;
                 }
             }
@@ -126,7 +151,15 @@ public static class SettingsStore
         try
         {
             Directory.CreateDirectory(ConfigDir);
-            File.WriteAllText(ConfigPath, new JavaScriptSerializer().Serialize(s));
+            // Atomic write: crash mid-save must never leave a half-written settings.json.
+            string tmp = ConfigPath + ".tmp";
+            File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(s));
+            try { File.Replace(tmp, ConfigPath, null); }
+            catch
+            {
+                try { File.Copy(tmp, ConfigPath, true); } catch { }
+                try { File.Delete(tmp); } catch { }
+            }
         }
         catch { }
     }

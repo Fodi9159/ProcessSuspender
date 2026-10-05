@@ -5,16 +5,23 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 public class SettingsForm : Form
 {
-    private TabControl _tabs;
+    private Button[] _navButtons;
+    private Panel[] _pages;
+    private int _selectedPage;
+    private Panel _contentPanel;
     private HotkeyBox _txtLockHotkey;
     private HotkeyBox _txtFreezeHotkey;
     private NumericUpDown _numPoll;
-    private CheckBox _chkAutoLock;
-    private CheckBox _chkAuto;
-    private CheckBox _chkLog;
+    private RadioButton _rbSuspend;
+    private RadioButton _rbEco;
+    private NumericUpDown _numEcoCap;
+    private FluentToggle _chkAuto;
+    private FluentToggle _chkLog;
+    private ComboBox _cmbTheme;
     private Label _lblPath;
     private Button _btnApply;
     private Button _btnClose;
@@ -27,6 +34,11 @@ public class SettingsForm : Form
     private ListBox _lstLocked;
     private Button _btnUnlock;
 
+    private static readonly string[] NavTitles = new string[]
+    {
+        "Settings", "Log", "Never suspend", "Locked windows"
+    };
+
     public SettingsForm()
     {
         try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -36,11 +48,19 @@ public class SettingsForm : Form
         MinimizeBox = true;
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(430, 500);
+        ClientSize = new Size(760, 560);
+        MinimumSize = new Size(700, 520);
+        AutoScaleMode = AutoScaleMode.Dpi;
         BuildUi();
         WireHotkeyCaptureEvents();
-        Shown += delegate { LoadSettings(); };
-        FormClosing += delegate { _logTimer.Dispose(); };
+        ApplyTheme();
+        try { SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged; } catch { }
+        Shown += delegate { LoadSettings(); ApplyTheme(); };
+        FormClosing += delegate
+        {
+            try { if (_logTimer != null) _logTimer.Dispose(); } catch { }
+            try { SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged; } catch { }
+        };
     }
 
     /// <summary>Raised with true while any hotkey field is capturing (global hotkeys are suspended then).</summary>
@@ -63,56 +83,299 @@ public class SettingsForm : Form
 
     public void ShowLogTab()
     {
-        _tabs.SelectedIndex = 1;
+        ShowPage(1);
         RefreshLog();
+    }
+
+    private void ShowPage(int index)
+    {
+        if (_pages == null || index < 0 || index >= _pages.Length) return;
+        _selectedPage = index;
+        for (int i = 0; i < _pages.Length; i++)
+        {
+            try { _pages[i].Visible = (i == index); } catch { }
+        }
+        try { _pages[index].BringToFront(); } catch { }
+        UpdateNavSelection();
+    }
+
+    private void UpdateNavSelection()
+    {
+        if (_navButtons == null) return;
+        bool dark = false;
+        try { dark = AppTheme.IsDark(ProcessSuspenderApp.Config); } catch { }
+        for (int i = 0; i < _navButtons.Length; i++)
+        {
+            try
+            {
+                _navButtons[i].Tag = (i == _selectedPage) ? "nav-selected" : "nav";
+                AppTheme.StyleNavButton(_navButtons[i], dark, i == _selectedPage);
+            }
+            catch { }
+        }
+    }
+
+    private FluentCard CreateCard(string title, string subtitle, int height)
+    {
+        FluentCard card = new FluentCard();
+        try
+        {
+            card.Height = height;
+            card.Dock = DockStyle.Top;
+            Label lblTitle = new Label();
+            lblTitle.Text = title;
+            lblTitle.Tag = "card-title";
+            lblTitle.Bounds = new Rectangle(16, 10, 600, 22);
+            lblTitle.AutoSize = false;
+            card.Controls.Add(lblTitle);
+            if (!string.IsNullOrEmpty(subtitle))
+            {
+                Label lblSub = new Label();
+                lblSub.Text = subtitle;
+                lblSub.Bounds = new Rectangle(16, 32, 600, 18);
+                lblSub.AutoSize = false;
+                card.Controls.Add(lblSub);
+            }
+        }
+        catch { }
+        return card;
     }
 
     private void BuildUi()
     {
-        _tabs = new TabControl { Bounds = new Rectangle(8, 8, 414, 440) };
+        // ---- Header (Win11 Settings title) ----
+        Panel header = new Panel();
+        header.Dock = DockStyle.Top;
+        header.Height = 76;
+        header.Padding = new Padding(20, 14, 20, 6);
+        Label lblTitle = new Label();
+        lblTitle.Text = "Process Suspender";
+        lblTitle.Tag = "page-title";
+        lblTitle.Bounds = new Rectangle(20, 10, 500, 30);
+        lblTitle.AutoSize = false;
+        header.Controls.Add(lblTitle);
+        Label lblSub = new Label();
+        lblSub.Text = "Freeze background apps when they lose focus";
+        lblSub.Tag = "page-subtitle";
+        lblSub.Bounds = new Rectangle(20, 42, 500, 20);
+        lblSub.AutoSize = false;
+        header.Controls.Add(lblSub);
+        // NOTE: not added here; dock z-order is fixed at the end of BuildUi
+        // (Fill must be added before edge-docked controls).
 
-        // ---- Settings tab ----
-        var tabSettings = new TabPage("Settings");
-
-        var grpBehavior = new GroupBox { Text = "Behavior", Bounds = new Rectangle(4, 4, 398, 84) };
-        var lblPoll = new Label { Text = "Poll interval (ms):", Bounds = new Rectangle(10, 26, 110, 20) };
-        _numPoll = new NumericUpDown { Bounds = new Rectangle(124, 22, 80, 24), Minimum = 125, Maximum = 2000, Increment = 125 };
-        _chkAutoLock = new CheckBox { Text = "Auto-lock fullscreen windows (e.g. games)", Bounds = new Rectangle(10, 54, 380, 22) };
-        grpBehavior.Controls.AddRange(new Control[] { lblPoll, _numPoll, _chkAutoLock });
-
-        var grpSystem = new GroupBox { Text = "System", Bounds = new Rectangle(4, 92, 398, 82) };
-        _chkAuto = new CheckBox { Text = "Auto-start with Windows", Bounds = new Rectangle(10, 24, 380, 22) };
-        _chkLog = new CheckBox { Text = "Write log to file", Bounds = new Rectangle(10, 50, 380, 22) };
-        grpSystem.Controls.AddRange(new Control[] { _chkAuto, _chkLog });
-
-        var grpHotkeys = new GroupBox { Text = "Hotkeys", Bounds = new Rectangle(4, 224, 398, 126) };
-        var lblLock = new Label { Text = "Lock to focused window:", Bounds = new Rectangle(10, 26, 190, 18) };
-        _txtLockHotkey = new HotkeyBox { Bounds = new Rectangle(210, 22, 160, 24) };
-        var btnClearLock = new Button { Text = "\u00D7", Bounds = new Rectangle(372, 22, 22, 24), FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 10f) };
-        btnClearLock.FlatAppearance.BorderSize = 0;
-        btnClearLock.Click += delegate { _txtLockHotkey.Combo = ""; };
-        var lblFreeze = new Label { Text = "Freeze on defocus:", Bounds = new Rectangle(10, 64, 190, 18) };
-        _txtFreezeHotkey = new HotkeyBox { Bounds = new Rectangle(210, 60, 160, 24) };
-        var btnClearFreeze = new Button { Text = "\u00D7", Bounds = new Rectangle(372, 60, 22, 24), FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 10f) };
-        btnClearFreeze.FlatAppearance.BorderSize = 0;
-        btnClearFreeze.Click += delegate { _txtFreezeHotkey.Combo = ""; };
-        var lblHotkeyHint = new Label
+        // ---- Footer (config path + actions) ----
+        Panel footer = new Panel();
+        footer.Dock = DockStyle.Bottom;
+        footer.Height = 60;
+        footer.Padding = new Padding(20, 12, 20, 12);
+        _lblPath = new Label();
+        _lblPath.Bounds = new Rectangle(20, 20, 430, 18);
+        _lblPath.AutoSize = false;
+        _lblPath.Anchor = AnchorStyles.Top | AnchorStyles.Left; // width set by the footer Resize handler below
+        _lblPath.Text = "Config: " + SettingsStore.ConfigPath;
+        footer.Controls.Add(_lblPath);
+        _btnClose = new Button();
+        _btnClose.Text = "Close";
+        _btnClose.Size = new Size(96, 32);
+        _btnClose.Location = new Point(542, 14);
+        _btnClose.Click += delegate { Close(); };
+        footer.Controls.Add(_btnClose);
+        _btnApply = new Button();
+        _btnApply.Text = "Apply";
+        _btnApply.Tag = "primary";
+        _btnApply.Size = new Size(96, 32);
+        _btnApply.Location = new Point(646, 14);
+        _btnApply.Click += delegate { OnApply(); };
+        footer.Controls.Add(_btnApply);
+        // Right-edge positions cannot rely on AnchorStyles.Right here: the
+        // footer is still at its default width (undocked, no parent yet), so
+        // the anchor distance would be captured against ~200px and the
+        // buttons would end up off-screen once the footer docks. Position
+        // them explicitly on every resize instead (same pattern as the
+        // card Resize handlers below).
+        footer.Resize += delegate
         {
-            Text = "Click a field to capture, or press \u00D7 to clear.",
-            Bounds = new Rectangle(10, 100, 380, 16),
-            ForeColor = Color.Gray
+            try
+            {
+                _btnApply.Left = Math.Max(0, footer.ClientSize.Width - 20 - _btnApply.Width);
+                _btnClose.Left = Math.Max(0, _btnApply.Left - 8 - _btnClose.Width);
+                _lblPath.Width = Math.Max(100, _btnClose.Left - 8 - 20);
+            }
+            catch { }
         };
+        // NOTE: added at the end of BuildUi in Fill-first dock order.
+
+        // ---- Main split: nav left, content right ----
+        Panel main = new Panel();
+        main.Dock = DockStyle.Fill;
+        main.Padding = new Padding(12, 4, 12, 4);
+        // NOTE: added at the end of BuildUi in Fill-first dock order.
+
+        Panel nav = new Panel();
+        nav.Width = 190;
+        nav.Dock = DockStyle.Left;
+        nav.Padding = new Padding(4, 4, 12, 4);
+        // NOTE: added at the end of BuildUi in Fill-first dock order.
+
+        _contentPanel = new Panel();
+        _contentPanel.Dock = DockStyle.Fill;
+        _contentPanel.Padding = new Padding(4, 4, 4, 4);
+        // NOTE: added at the end of BuildUi in Fill-first dock order.
+
+        _navButtons = new Button[NavTitles.Length];
+        for (int i = 0; i < NavTitles.Length; i++)
+        {
+            Button nb = new Button();
+            nb.Text = NavTitles[i];
+            nb.Tag = (i == 0) ? "nav-selected" : "nav";
+            nb.Height = 40;
+            nb.Dock = DockStyle.Top;
+            int idx = i;
+            nb.Click += delegate { ShowPage(idx); };
+            // Dock Top stacks in reverse; add in reverse at the end.
+            _navButtons[i] = nb;
+        }
+        for (int i = _navButtons.Length - 1; i >= 0; i--)
+            nav.Controls.Add(_navButtons[i]);
+
+        _pages = new Panel[NavTitles.Length];
+        for (int i = 0; i < _pages.Length; i++)
+        {
+            Panel p = new Panel();
+            p.Dock = DockStyle.Fill;
+            p.AutoScroll = true;
+            p.Padding = new Padding(4, 4, 10, 10);
+            p.Visible = (i == 0);
+            _contentPanel.Controls.Add(p);
+            // Fill-docked pages stack; keep only selected on top.
+            try { p.BringToFront(); } catch { }
+            _pages[i] = p;
+        }
+        _selectedPage = 0;
+        try { _pages[0].BringToFront(); } catch { }
+
+        BuildSettingsPage(_pages[0]);
+        BuildLogPage(_pages[1]);
+        BuildNeverPage(_pages[2]);
+        BuildLockedPage(_pages[3]);
+
+        // ---- Dock z-order (the actual layout fix) ----
+        // WinForms docks in z-order: a Fill panel added AFTER an edge-docked
+        // panel covers the whole area and slides underneath it. That is what
+        // the screenshot showed (card labels hidden behind the nav, first
+        // card hidden behind the header). Fill must be added FIRST so edges
+        // take their strip and Fill gets the remainder.
+        main.Controls.Add(_contentPanel); // Fill first -> remainder
+        main.Controls.Add(nav);           // Left second -> left strip
+        Controls.Add(main);               // Fill first -> middle remainder
+        Controls.Add(footer);             // Bottom second -> bottom strip
+        Controls.Add(header);             // Top last -> top strip
+
+        _logTimer = new Timer { Interval = 500 };
+        _logTimer.Tick += delegate { RefreshLog(); RefreshLocked(); };
+        _logTimer.Start();
+    }
+
+    private void BuildSettingsPage(Panel page)
+    {
+        // ---- Card: Freezing ----
+        FluentCard grpBehavior = CreateCard("Freezing",
+            "How the target is quieted when it loses focus.", 168);
+        Label lblPoll = new Label();
+        lblPoll.Text = "Poll interval (ms)";
+        lblPoll.Bounds = new Rectangle(16, 58, 150, 20);
+        _numPoll = new NumericUpDown();
+        _numPoll.Bounds = new Rectangle(180, 56, 90, 24);
+        _numPoll.Minimum = 125;
+        _numPoll.Maximum = 2000;
+        _numPoll.Increment = 125;
+        Label lblMode = new Label();
+        lblMode.Text = "Freeze mode";
+        lblMode.Bounds = new Rectangle(16, 88, 150, 20);
+        _rbSuspend = new RadioButton();
+        _rbSuspend.Text = "Suspend  (0% CPU)";
+        _rbSuspend.Bounds = new Rectangle(180, 86, 220, 22);
+        _rbEco = new RadioButton();
+        _rbEco.Text = "Eco low-power  (keeps running)";
+        _rbEco.Bounds = new Rectangle(180, 108, 260, 22);
+        Label lblCap = new Label();
+        lblCap.Text = "Eco CPU cap (%)";
+        lblCap.Bounds = new Rectangle(16, 134, 150, 20);
+        _numEcoCap = new NumericUpDown();
+        _numEcoCap.Bounds = new Rectangle(180, 132, 90, 24);
+        _numEcoCap.Minimum = 0.1m;
+        _numEcoCap.Maximum = 100;
+        _numEcoCap.DecimalPlaces = 1;
+        _numEcoCap.Increment = 0.5m;
+        Label lblCapHint = new Label();
+        lblCapHint.Text = "0.1\u2013100, default 2";
+        lblCapHint.Bounds = new Rectangle(278, 134, 200, 20);
+        grpBehavior.Controls.AddRange(new Control[] { lblPoll, _numPoll, lblMode, _rbSuspend, _rbEco, lblCap, _numEcoCap, lblCapHint });
+
+        // ---- Card: System ----
+        FluentCard grpSystem = CreateCard("System",
+            "Startup, logging and appearance.", 150);
+        _chkAuto = new FluentToggle();
+        _chkAuto.Text = "Auto-start with Windows";
+        _chkAuto.Bounds = new Rectangle(16, 58, 300, 24);
+        _chkLog = new FluentToggle();
+        _chkLog.Text = "Write log to file";
+        _chkLog.Bounds = new Rectangle(16, 86, 300, 24);
+        Label lblTheme = new Label();
+        lblTheme.Text = "Appearance";
+        lblTheme.Bounds = new Rectangle(16, 116, 150, 20);
+        _cmbTheme = new ComboBox();
+        _cmbTheme.Bounds = new Rectangle(180, 112, 180, 24);
+        _cmbTheme.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cmbTheme.Items.AddRange(new object[] { "Follow Windows", "Light", "Dark" });
+        _cmbTheme.SelectedIndexChanged += delegate { PreviewThemeSelection(); };
+        grpSystem.Controls.AddRange(new Control[] { _chkAuto, _chkLog, lblTheme, _cmbTheme });
+
+        // ---- Card: Hotkeys ----
+        FluentCard grpHotkeys = CreateCard("Hotkeys",
+            "Click a field to capture a new combination, or clear it.", 148);
+        Label lblLock = new Label();
+        lblLock.Text = "Lock to focused window";
+        lblLock.Bounds = new Rectangle(16, 60, 180, 20);
+        _txtLockHotkey = new HotkeyBox();
+        _txtLockHotkey.Bounds = new Rectangle(210, 58, 170, 24);
+        Button btnClearLock = new Button();
+        btnClearLock.Text = "\u00D7";
+        btnClearLock.Bounds = new Rectangle(386, 58, 30, 24);
+        try { btnClearLock.Font = new Font("Segoe UI", 10f); } catch { }
+        btnClearLock.Click += delegate { _txtLockHotkey.Combo = ""; };
+        Label lblFreeze = new Label();
+        lblFreeze.Text = "Enable / disable the app";
+        lblFreeze.Bounds = new Rectangle(16, 92, 180, 20);
+        _txtFreezeHotkey = new HotkeyBox();
+        _txtFreezeHotkey.Bounds = new Rectangle(210, 90, 170, 24);
+        Button btnClearFreeze = new Button();
+        btnClearFreeze.Text = "\u00D7";
+        btnClearFreeze.Bounds = new Rectangle(386, 90, 30, 24);
+        try { btnClearFreeze.Font = new Font("Segoe UI", 10f); } catch { }
+        btnClearFreeze.Click += delegate { _txtFreezeHotkey.Combo = ""; };
+        Label lblHotkeyHint = new Label();
+        lblHotkeyHint.Text = "Example: Ctrl+Alt+F9. Escape cancels, Tab moves on.";
+        lblHotkeyHint.Bounds = new Rectangle(16, 120, 420, 18);
         grpHotkeys.Controls.AddRange(new Control[]
         {
             lblLock, _txtLockHotkey, btnClearLock, lblFreeze, _txtFreezeHotkey, btnClearFreeze, lblHotkeyHint
         });
+        // DockStyle.Top stacks last-added on top, so add bottom-up.
+        page.Controls.Add(grpHotkeys);
+        page.Controls.Add(grpSystem);
+        page.Controls.Add(grpBehavior);
+    }
 
-        _lblPath = new Label { Bounds = new Rectangle(8, 354, 400, 18), ForeColor = Color.Gray, Text = "Config: " + SettingsStore.ConfigPath };
-        tabSettings.Controls.AddRange(new Control[] { grpBehavior, grpSystem, grpHotkeys, _lblPath });
-
-        // ---- Log tab ----
-        var tabLog = new TabPage("Log");
-        _btnOpenLog = new Button { Text = "Open log file", Bounds = new Rectangle(252, 6, 150, 28) };
+    private void BuildLogPage(Panel page)
+    {
+        FluentCard card = CreateCard("Log",
+            "Live view of what the app is doing. Full history is in the log file.", 400);
+        card.Dock = DockStyle.Fill;
+        _btnOpenLog = new Button();
+        _btnOpenLog.Text = "Open log file";
+        _btnOpenLog.Bounds = new Rectangle(16, 58, 140, 32);
+        _btnOpenLog.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _btnOpenLog.Click += delegate
         {
             try
@@ -124,28 +387,40 @@ public class SettingsForm : Form
             }
             catch { }
         };
-        _txtLog = new TextBox
+        _txtLog = new TextBox();
+        _txtLog.Multiline = true;
+        _txtLog.ReadOnly = true;
+        _txtLog.ScrollBars = ScrollBars.Both;
+        try { _txtLog.Font = new Font("Cascadia Mono", 9f); } catch { try { _txtLog.Font = new Font("Consolas", 9f); } catch { } }
+        _txtLog.Bounds = new Rectangle(16, 98, 480, 270);
+        _txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        card.Controls.AddRange(new Control[] { _btnOpenLog, _txtLog });
+        page.Controls.Add(card);
+        // Keep the open button right-aligned as the card resizes.
+        card.Resize += delegate
         {
-            Bounds = new Rectangle(6, 40, 396, 300),
-            Multiline = true,
-            ReadOnly = true,
-            ScrollBars = ScrollBars.Both,
-            Font = new Font("Consolas", 9f),
-            BackColor = Color.White
+            try { _btnOpenLog.Left = Math.Max(16, card.ClientSize.Width - 156); } catch { }
+            try { _txtLog.Width = Math.Max(100, card.ClientSize.Width - 32); } catch { }
+            try { _txtLog.Height = Math.Max(80, card.ClientSize.Height - 114); } catch { }
         };
-        tabLog.Controls.AddRange(new Control[] { _btnOpenLog, _txtLog });
+    }
 
-        // ---- Never suspend tab ----
-        var tabNever = new TabPage("Never suspend");
-        var lblNeverHint = new Label
-        {
-            Text = "These processes (and services) are never locked or suspended.",
-            Bounds = new Rectangle(4, 4, 398, 18),
-            ForeColor = Color.Gray
-        };
-        var lblNeverName = new Label { Text = "Process or service name:", Bounds = new Rectangle(10, 30, 160, 20) };
-        _txtNeverSuspend = new TextBox { Bounds = new Rectangle(10, 52, 250, 24) };
-        var btnNeverAdd = new Button { Text = "Add", Bounds = new Rectangle(268, 50, 70, 28) };
+    private void BuildNeverPage(Panel page)
+    {
+        FluentCard card = CreateCard("Never suspend",
+            "These processes are never locked or suspended.", 430);
+        card.Dock = DockStyle.Fill;
+        Label lblNeverName = new Label();
+        lblNeverName.Text = "Process or service name";
+        lblNeverName.Bounds = new Rectangle(16, 58, 200, 20);
+        _txtNeverSuspend = new TextBox();
+        _txtNeverSuspend.Bounds = new Rectangle(16, 80, 260, 24);
+        _txtNeverSuspend.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        Button btnNeverAdd = new Button();
+        btnNeverAdd.Text = "Add";
+        btnNeverAdd.Tag = "primary";
+        btnNeverAdd.Bounds = new Rectangle(286, 78, 80, 30);
+        btnNeverAdd.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         btnNeverAdd.Click += delegate { AddNeverSuspend(); };
         _txtNeverSuspend.KeyDown += delegate(object s, KeyEventArgs e)
         {
@@ -156,69 +431,92 @@ public class SettingsForm : Form
                 e.SuppressKeyPress = true;
             }
         };
-        _lstNeverSuspend = new ListBox { Bounds = new Rectangle(10, 88, 394, 206), IntegralHeight = false };
-        var btnNeverRemove = new Button { Text = "Remove", Bounds = new Rectangle(10, 302, 90, 28) };
+        _lstNeverSuspend = new ListBox();
+        _lstNeverSuspend.Bounds = new Rectangle(16, 114, 350, 200);
+        _lstNeverSuspend.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        _lstNeverSuspend.IntegralHeight = false;
+        Button btnNeverRemove = new Button();
+        btnNeverRemove.Text = "Remove";
+        btnNeverRemove.Bounds = new Rectangle(16, 322, 96, 32);
+        btnNeverRemove.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         btnNeverRemove.Click += delegate { RemoveNeverSuspend(); };
-        var lblNeverNote = new Label
+        Label lblNeverNote = new Label();
+        lblNeverNote.Text = "Matches the process name (\u201Cexplorer\u201D, \u201Cexplorer.exe\u201D). Services are covered by their host process (e.g. \u201Csvchost\u201D). Explorer is included by default.";
+        lblNeverNote.Bounds = new Rectangle(16, 362, 350, 50);
+        lblNeverNote.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        card.Controls.AddRange(new Control[]
         {
-            Text = "Matches the process name (\"explorer\", \"explorer.exe\"). Services are\n"
-                 + "covered by their host process (e.g. \"svchost\"). Explorer is included\n"
-                 + "by default. Saved automatically when you Add/Remove.",
-            Bounds = new Rectangle(10, 340, 394, 50),
-            ForeColor = Color.Gray
-        };
-        tabNever.Controls.AddRange(new Control[]
-        {
-            lblNeverHint, lblNeverName, _txtNeverSuspend, btnNeverAdd,
+            lblNeverName, _txtNeverSuspend, btnNeverAdd,
             _lstNeverSuspend, btnNeverRemove, lblNeverNote
         });
-
-        // ---- Locked windows tab ----
-        var tabLocked = new TabPage("Locked windows");
-        var lblLockedHint = new Label
+        page.Controls.Add(card);
+        card.Resize += delegate
         {
-            Text = "Windows you locked (Pick / Lock hotkey). Suspended when not focused.",
-            Bounds = new Rectangle(4, 4, 398, 18),
-            ForeColor = Color.Gray
+            try
+            {
+                _txtNeverSuspend.Width = Math.Max(80, card.ClientSize.Width - 130);
+                btnNeverAdd.Left = card.ClientSize.Width - 96;
+                _lstNeverSuspend.Width = Math.Max(100, card.ClientSize.Width - 32);
+                _lstNeverSuspend.Height = Math.Max(60, card.ClientSize.Height - 228);
+                btnNeverRemove.Top = card.ClientSize.Height - 108;
+                lblNeverNote.Top = card.ClientSize.Height - 68;
+                lblNeverNote.Width = Math.Max(100, card.ClientSize.Width - 32);
+            }
+            catch { }
         };
-        _lstLocked = new ListBox { Bounds = new Rectangle(10, 28, 394, 318), IntegralHeight = false };
-        _btnUnlock = new Button { Text = "Unlock", Bounds = new Rectangle(10, 352, 90, 28) };
+    }
+
+    private void BuildLockedPage(Panel page)
+    {
+        FluentCard card = CreateCard("Locked windows",
+            "Windows you locked (Pick / Lock hotkey). Suspended when not focused.", 440);
+        card.Dock = DockStyle.Fill;
+        _lstLocked = new ListBox();
+        _lstLocked.Bounds = new Rectangle(16, 58, 350, 280);
+        _lstLocked.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        _lstLocked.IntegralHeight = false;
+        _btnUnlock = new Button();
+        _btnUnlock.Text = "Unlock";
+        _btnUnlock.Bounds = new Rectangle(16, 346, 96, 32);
+        _btnUnlock.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         _btnUnlock.Click += delegate { UnlockSelected(); };
-        var _btnRefresh = new Button { Text = "Refresh", Bounds = new Rectangle(106, 352, 90, 28) };
-        _btnRefresh.Click += delegate { RefreshLocked(); };
-        var lblLockedNote = new Label
+        Button btnRefresh = new Button();
+        btnRefresh.Text = "Refresh";
+        btnRefresh.Bounds = new Rectangle(120, 346, 96, 32);
+        btnRefresh.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+        btnRefresh.Click += delegate { RefreshLocked(); };
+        Label lblLockedNote = new Label();
+        lblLockedNote.Text = "Updates live. Select an entry and click Unlock to remove it from the set.";
+        lblLockedNote.Bounds = new Rectangle(16, 386, 350, 30);
+        lblLockedNote.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        card.Controls.AddRange(new Control[] { _lstLocked, _btnUnlock, btnRefresh, lblLockedNote });
+        page.Controls.Add(card);
+        card.Resize += delegate
         {
-            Text = "Updates live. Select an entry and click Unlock to remove it from the set.",
-            Bounds = new Rectangle(10, 388, 394, 30),
-            ForeColor = Color.Gray
+            try
+            {
+                _lstLocked.Width = Math.Max(100, card.ClientSize.Width - 32);
+                _lstLocked.Height = Math.Max(60, card.ClientSize.Height - 152);
+                _btnUnlock.Top = card.ClientSize.Height - 94;
+                btnRefresh.Top = card.ClientSize.Height - 94;
+                lblLockedNote.Top = card.ClientSize.Height - 54;
+                lblLockedNote.Width = Math.Max(100, card.ClientSize.Width - 32);
+            }
+            catch { }
         };
-        tabLocked.Controls.AddRange(new Control[] { lblLockedHint, _lstLocked, _btnUnlock, _btnRefresh, lblLockedNote });
-
-        _tabs.TabPages.Add(tabSettings);
-        _tabs.TabPages.Add(tabLog);
-        _tabs.TabPages.Add(tabNever);
-        _tabs.TabPages.Add(tabLocked);
-
-        _btnApply = new Button { Text = "Apply", Bounds = new Rectangle(330, 460, 92, 30) };
-        _btnApply.Click += delegate { OnApply(); };
-        _btnClose = new Button { Text = "Close", Bounds = new Rectangle(230, 460, 92, 30) };
-        _btnClose.Click += delegate { Close(); };
-
-        Controls.Add(_tabs);
-        Controls.Add(_btnApply);
-        Controls.Add(_btnClose);
-
-        _logTimer = new Timer { Interval = 500 };
-        _logTimer.Tick += delegate { RefreshLog(); RefreshLocked(); };
-        _logTimer.Start();
     }
 
     private void LoadSettings()
     {
         _numPoll.Value = ProcessSuspenderApp.Config.PollIntervalMsClamped;
-        _chkAutoLock.Checked = ProcessSuspenderApp.Config.AutoLockFullscreen;
         _chkAuto.Checked = ProcessSuspenderApp.Config.AutoStartWithWindows;
         _chkLog.Checked = ProcessSuspenderApp.Config.LogToFile;
+        bool eco = ProcessSuspenderApp.IsEcoMode();
+        _rbSuspend.Checked = !eco;
+        _rbEco.Checked = eco;
+        try { _numEcoCap.Value = (decimal)ProcessSuspenderApp.Config.EcoCpuCapPercentClamped; }
+        catch { _numEcoCap.Value = 2; }
+        SetThemeCombo(AppTheme.NormalizeTheme(ProcessSuspenderApp.Config.Theme));
         _txtLockHotkey.Combo = ProcessSuspenderApp.Config.LockHotkey;
         _txtFreezeHotkey.Combo = ProcessSuspenderApp.Config.FreezeHotkey;
         _lstNeverSuspend.Items.Clear();
@@ -227,6 +525,82 @@ public class SettingsForm : Form
             foreach (string s in ProcessSuspenderApp.Config.NeverSuspend)
                 _lstNeverSuspend.Items.Add(s);
         }
+        ApplyTheme();
+    }
+
+    /// <summary>Applies the current effective theme to this window.</summary>
+    public void ApplyTheme()
+    {
+        try
+        {
+            bool dark = AppTheme.IsDark(ProcessSuspenderApp.Config);
+            AppTheme.ApplyForm(this, dark);
+            UpdateNavSelection();
+        }
+        catch { }
+    }
+
+    private void SetThemeCombo(string theme)
+    {
+        try
+        {
+            if (_cmbTheme == null) return;
+            if (theme == "Dark") _cmbTheme.SelectedIndex = 2;
+            else if (theme == "Light") _cmbTheme.SelectedIndex = 1;
+            else _cmbTheme.SelectedIndex = 0;
+        }
+        catch { }
+    }
+
+    private string GetThemeCombo()
+    {
+        try
+        {
+            if (_cmbTheme == null) return "System";
+            if (_cmbTheme.SelectedIndex == 2) return "Dark";
+            if (_cmbTheme.SelectedIndex == 1) return "Light";
+        }
+        catch { }
+        return "System";
+    }
+
+    /// <summary>Live preview when the Appearance dropdown changes (persisted on Apply).</summary>
+    private void PreviewThemeSelection()
+    {
+        try
+        {
+            string t = GetThemeCombo();
+            bool dark = AppTheme.IsDark(t);
+            AppTheme.ApplyForm(this, dark);
+            UpdateNavSelection();
+        }
+        catch { }
+    }
+
+    private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+    {
+        try
+        {
+            if (IsDisposed || !Visible) return;
+            // Only auto-follow when the saved mode is System; a preview selection
+            // of System also follows so the dropdown feels live.
+            string saved = "System";
+            try { saved = AppTheme.NormalizeTheme(ProcessSuspenderApp.Config.Theme); } catch { }
+            string shown = GetThemeCombo();
+            if (saved != "System" && shown != "System") return;
+            bool dark = AppTheme.IsWindowsDark();
+            if (shown == "Light") dark = false;
+            else if (shown == "Dark") dark = true;
+            if (InvokeRequired)
+            {
+                bool d = dark;
+                try { BeginInvoke((Action)delegate { try { AppTheme.ApplyForm(this, d); UpdateNavSelection(); } catch { } }); } catch { }
+                return;
+            }
+            AppTheme.ApplyForm(this, dark);
+            UpdateNavSelection();
+        }
+        catch { }
     }
 
     private void AddNeverSuspend()
@@ -277,22 +651,35 @@ public class SettingsForm : Form
                 "Process Suspender", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
+        if (!string.IsNullOrEmpty(lockHotkey) && lockHotkey.Equals(freezeHotkey, StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this,
+                "Lock and Freeze hotkeys must be different.",
+                "Process Suspender", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
 
         ProcessSuspenderApp.Config.PollIntervalMs = (int)_numPoll.Value;
-        ProcessSuspenderApp.Config.AutoLockFullscreen = _chkAutoLock.Checked;
         ProcessSuspenderApp.Config.AutoStartWithWindows = _chkAuto.Checked;
         ProcessSuspenderApp.Config.LogToFile = _chkLog.Checked;
+        ProcessSuspenderApp.Config.Theme = GetThemeCombo();
+        ProcessSuspenderApp.Config.FreezeMode = (_rbEco != null && _rbEco.Checked) ? "Eco" : "Suspend";
+        try { ProcessSuspenderApp.Config.EcoCpuCapPercent = (double)_numEcoCap.Value; }
+        catch { ProcessSuspenderApp.Config.EcoCpuCapPercent = 2; }
         ProcessSuspenderApp.Config.LockHotkey = lockHotkey;
         ProcessSuspenderApp.Config.FreezeHotkey = freezeHotkey;
         ProcessSuspenderApp.Config.NeverSuspend = NormalizeNeverSuspend();
         SettingsStore.Save(ProcessSuspenderApp.Config);
         SettingsStore.SetAutoStart(_chkAuto.Checked);
         ProcessSuspenderApp.ApplySettings();
+        ApplyTheme();
     }
 
     private void RefreshLog()
     {
         if (IsDisposed || !Visible) return;
+        if (_txtLog == null) return;
+        if (_selectedPage != 1) return;
         string[] lines = ProcessSuspenderApp.GetLogLines();
         if (lines.Length == _lastLogCount) return;
         _lastLogCount = lines.Length;
@@ -305,12 +692,17 @@ public class SettingsForm : Form
     private void RefreshLocked()
     {
         if (IsDisposed || !Visible || _lstLocked == null) return;
+        if (_selectedPage != 3) return;
         var entries = ProcessSuspenderApp.GetLockedWindows();
         // Rebuild only when the displayed text changes, so the live selection
         // highlight isn't wiped by the 500ms timer.
         string[] next = new string[entries.Count];
         for (int i = 0; i < entries.Count; i++)
-            next[i] = (entries[i].Suspended ? "⛔ SUSPENDED  " : "✅ active  ") + entries[i].Label;
+        {
+            string prefix = "Active  \u25CF  ";
+            if (entries[i].Suspended) prefix = entries[i].Eco ? "Throttled  \u25CF  " : "Suspended  \u25CF  ";
+            next[i] = prefix + entries[i].Label;
+        }
         bool changed = _lstLocked.Items.Count != next.Length;
         if (!changed)
         {
@@ -372,6 +764,8 @@ public static class WindowPicker
     public static bool Pick()
     {
         var items = new List<WindowItem>();
+        int selfId = -1;
+        try { selfId = Process.GetCurrentProcess().Id; } catch { }
         EnumWindows(delegate(IntPtr h, IntPtr lp)
         {
             if (!IsWindowVisible(h)) return true;
@@ -379,43 +773,46 @@ public static class WindowPicker
             if (GetWindowText(h, sb, sb.Capacity) == 0) return true;
             uint p;
             GetWindowThreadProcessId(h, out p);
+            if ((int)p == selfId) return true; // never list our own windows - locking them would freeze us
             items.Add(new WindowItem { Hwnd = h, Pid = p, Title = sb.ToString() });
             return true;
         }, IntPtr.Zero);
 
         using (var dlg = new Form
         {
-            Text = "Pick windows to suspend",
+            Text = "Pick windows to freeze",
             StartPosition = FormStartPosition.CenterScreen,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MinimizeBox = false,
             MaximizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(470, 370)
+            ClientSize = new Size(520, 430)
         })
         {
             var label = new Label
             {
-                Text = "Select one or more windows (Ctrl/Shift+click or drag). They are suspended when not focused.",
-                Bounds = new Rectangle(10, 6, 450, 28)
+                Text = "Select one or more windows (Ctrl/Shift+click or drag). They are frozen when not focused.",
+                Bounds = new Rectangle(20, 14, 480, 32)
             };
             var list = new ListBox
             {
-                Bounds = new Rectangle(10, 36, 450, 280),
+                Bounds = new Rectangle(20, 50, 480, 310),
                 IntegralHeight = false,
                 SelectionMode = SelectionMode.MultiExtended
             };
             foreach (WindowItem it in items)
-                list.Items.Add(it.Pid + "  -  " + it.Title);
+                list.Items.Add(it.Pid + "  \u2014  " + it.Title);
 
-            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Bounds = new Rectangle(300, 322, 75, 28) };
-            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(385, 322, 75, 28) };
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Bounds = new Rectangle(332, 372, 96, 32) };
+            ok.Tag = "primary";
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(436, 372, 96, 32) };
             dlg.Controls.Add(label);
             dlg.Controls.Add(list);
             dlg.Controls.Add(ok);
             dlg.Controls.Add(cancel);
             dlg.AcceptButton = ok;
             dlg.CancelButton = cancel;
+            try { AppTheme.ApplyForm(dlg, AppTheme.IsDark(ProcessSuspenderApp.Config)); } catch { }
 
             if (dlg.ShowDialog() != DialogResult.OK || list.SelectedIndices.Count == 0) return false;
             selected = new List<WindowItem>();

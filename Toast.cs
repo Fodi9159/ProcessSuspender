@@ -19,65 +19,146 @@ internal static class Toast
     public static void Show(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
-        var t = new ToastForm(text);
-        t.Show();
+        try
+        {
+            // Toasts need a message loop (WinForms Timer). If called from a
+            // background/hook thread, marshal creation to the UI thread so the
+            // fade timer ticks and the window does not leak.
+            if (Application.OpenForms.Count > 0)
+            {
+                Form owner = Application.OpenForms[0];
+                if (owner.InvokeRequired)
+                {
+                    try { owner.BeginInvoke((Action)delegate { ShowOnUi(text); }); }
+                    catch { }
+                    return;
+                }
+            }
+            ShowOnUi(text);
+        }
+        catch { }
+    }
+
+    private static void ShowOnUi(string text)
+    {
+        try
+        {
+            var t = new ToastForm(text);
+            t.Show();
+        }
+        catch { }
     }
 
     private class ToastForm : Form
     {
         private readonly Timer _timer;
-        private double _opacity = 1.0;
+        private int _ticks;
+        private readonly bool _dark;
+        private readonly string _text;
+        private readonly Font _font;
 
         public ToastForm(string text)
         {
+            _text = text;
+            try { _dark = AppTheme.IsDark(ProcessSuspenderApp.Config); }
+            catch { _dark = true; }
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
             DoubleBuffered = true;
 
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold);
-            Size = TextRenderer.MeasureText(text, Font) + new Size(40, 20);
+            try { _font = AppTheme.UiFont(9.5f); }
+            catch { _font = new Font("Segoe UI", 9.5f); }
+            Font = _font;
+
+            // Fluent notification card: wrap long text, cap width like Win11.
+            int maxW = 420;
+            Size proposed = new Size(maxW - 48, 1000);
+            Size measured;
+            try
+            {
+                measured = TextRenderer.MeasureText(text, Font, proposed,
+                    TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
+            }
+            catch { measured = TextRenderer.MeasureText(text, Font); }
+            int w = Math.Min(maxW, Math.Max(220, measured.Width + 48));
+            int h = Math.Max(56, measured.Height + 32);
+            // Re-measure at the final width for a tight wrap.
+            try
+            {
+                Size m2 = TextRenderer.MeasureText(text, Font, new Size(w - 48, 1000),
+                    TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
+                h = Math.Max(56, Math.Min(220, m2.Height + 32));
+            }
+            catch { }
+            Size = new Size(w, h);
 
             Screen screen = Screen.PrimaryScreen;
             int x = (screen.WorkingArea.Width - Width) / 2;
             int y = screen.WorkingArea.Bottom - Height - 50;
             Location = new Point(x, y);
 
-            BackColor = Color.FromArgb(40, 40, 40);
-            ForeColor = Color.White;
-            Paint += (s, e) =>
-            {
-                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                using (var path = RoundedRect(new Rectangle(0, 0, Width, Height), 10))
-                {
-                    Region = new Region(path);
-                }
-                TextRenderer.DrawText(e.Graphics, text, Font, new Rectangle(20, 10, Width - 40, Height - 20),
-                    ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter);
-            };
+            BackColor = _dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(249, 249, 249);
+            ForeColor = _dark ? Color.White : Color.FromArgb(27, 27, 27);
+            try { AppTheme.ApplyWindowChrome(Handle, _dark); } catch { }
+            Paint += OnPaint;
 
+            // Visible ~1.6s, then fade out over ~0.6s.
             _timer = new Timer { Interval = 50 };
-            _timer.Tick += (s, e) =>
-            {
-                _opacity -= 0.04;
-                if (_opacity <= 0)
-                {
-                    _timer.Stop();
-                    Close();
-                    Dispose();
-                }
-                else
-                {
-                    Opacity = _opacity;
-                }
-            };
+            _timer.Tick += OnTick;
 
-            Shown += (s, e) =>
+            Shown += delegate
             {
                 Opacity = 1.0;
+                _ticks = 0;
                 _timer.Start();
             };
+        }
+
+        private void OnPaint(object s, PaintEventArgs e)
+        {
+            try
+            {
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                Color fill = BackColor;
+                Color border = _dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(225, 225, 225);
+                using (GraphicsPath path = AppTheme.RoundedRect(new Rectangle(0, 0, Width, Height), 8))
+                {
+                    Region = new Region(path);
+                    using (SolidBrush br = new SolidBrush(fill))
+                        g.FillPath(br, path);
+                    using (Pen pen = new Pen(border, 1f))
+                        g.DrawPath(pen, path);
+                }
+                // Accent bar on the left, like a Win11 InfoBar.
+                Color acc = AppTheme.Accent(_dark);
+                using (SolidBrush br = new SolidBrush(acc))
+                    g.FillRectangle(br, 12, 14, 3, Math.Max(10, Height - 28));
+                TextRenderer.DrawText(g, _text, Font,
+                    new Rectangle(24, 12, Width - 36, Height - 24),
+                    ForeColor, TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+            }
+            catch { }
+        }
+
+        private void OnTick(object s, EventArgs e)
+        {
+            _ticks++;
+            if (_ticks < 32) return; // hold fully visible first
+            double op = Opacity - 0.08;
+            if (op <= 0)
+            {
+                _timer.Stop();
+                Close();
+                Dispose();
+            }
+            else
+            {
+                Opacity = op;
+            }
         }
 
         protected override void SetVisibleCore(bool value)
@@ -94,22 +175,10 @@ internal static class Toast
         {
             get
             {
-                var cp = base.CreateParams;
+                CreateParams cp = base.CreateParams;
                 cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
                 return cp;
             }
-        }
-
-        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
-        {
-            int d = radius * 2;
-            var path = new GraphicsPath();
-            path.AddArc(bounds.X, bounds.Y, d, d, 180, 90);
-            path.AddArc(bounds.Right - d, bounds.Y, d, d, 270, 90);
-            path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-            path.AddArc(bounds.X, bounds.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
         }
     }
 }

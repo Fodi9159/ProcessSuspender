@@ -54,6 +54,8 @@ public sealed class InputHook : IDisposable
     private const uint VK_MENU = 0x12;
     private const uint VK_LMENU = 0xA4;
     private const uint VK_RMENU = 0xA5;
+    private const uint VK_LWIN = 0x5B;
+    private const uint VK_RWIN = 0x5C;
     private const int WM_LBUTTONDOWN = 0x0201;
     private const int WM_LBUTTONUP = 0x0202;
 
@@ -73,6 +75,7 @@ public sealed class InputHook : IDisposable
     private readonly LLHookProc _mouseProc;
     private readonly bool[] _keyDown = new bool[256];
     private bool _altDown;
+    private bool _winDown;
     private bool _tabSinceAlt;
     private bool _lastSwitch;
 
@@ -112,7 +115,12 @@ public sealed class InputHook : IDisposable
                     if (!_altDown) _tabSinceAlt = false;
                     _altDown = true;
                 }
-                else if (kb.vkCode == VK_TAB && _altDown)
+                else if (IsWin(kb.vkCode))
+                {
+                    if (!_winDown) _tabSinceAlt = false;
+                    _winDown = true;
+                }
+                else if (kb.vkCode == VK_TAB && (_altDown || _winDown))
                 {
                     _tabSinceAlt = true;
                 }
@@ -121,12 +129,14 @@ public sealed class InputHook : IDisposable
             {
                 if (kb.vkCode < 256) _keyDown[kb.vkCode] = false;
                 if (IsAlt(kb.vkCode)) _altDown = false;
+                if (IsWin(kb.vkCode)) _winDown = false;
             }
 
             // Only treat the gesture as a window switch when Tab is used while Alt
-            // is held (a real Alt+Tab, either direction). A stray Alt press (menus,
+            // or Win is held (a real Alt+Tab / Win+Tab). A stray Alt press (menus,
             // shortcuts) must not unfreeze the game.
-            bool active = _altDown && (_keyDown[VK_TAB] || _tabSinceAlt);
+            bool modifierHeld = _altDown || _winDown;
+            bool active = modifierHeld && (_keyDown[VK_TAB] || _tabSinceAlt);
             if (active != _lastSwitch)
             {
                 _lastSwitch = active;
@@ -139,6 +149,11 @@ public sealed class InputHook : IDisposable
     private static bool IsAlt(uint vk)
     {
         return vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU;
+    }
+
+    private static bool IsWin(uint vk)
+    {
+        return vk == VK_LWIN || vk == VK_RWIN;
     }
 
     private IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
