@@ -63,17 +63,25 @@ public static class AppTheme
     /// <summary>True when Windows apps are in dark mode (HKCU Personalize key).</summary>
     public static bool IsWindowsDark()
     {
+        // Cached for 2s: called per nav-button paint otherwise (Registry I/O per
+        // paint is orders of magnitude more expensive than the brush it draws).
+        if ((DateTime.UtcNow - _winDarkAt).TotalSeconds < 2) return _winDark;
+        _winDarkAt = DateTime.UtcNow;
         try
         {
             object v = Registry.GetValue(
                 @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
                 "AppsUseLightTheme", 1);
-            if (v == null) return false;
-            try { return Convert.ToInt32(v) == 0; }
-            catch { return false; }
+            if (v == null) { _winDark = false; return false; }
+            try { _winDark = Convert.ToInt32(v) == 0; }
+            catch { _winDark = false; }
+            return _winDark;
         }
-        catch { return false; }
+        catch { _winDark = false; return false; }
     }
+
+    private static bool _winDark;
+    private static DateTime _winDarkAt = DateTime.MinValue;
 
     public static bool IsDark(Settings s)
     {
@@ -152,14 +160,32 @@ public static class AppTheme
     /// <summary>Preferred UI font: Segoe UI Variable (Win11) with Segoe UI fallback.</summary>
     public static Font UiFont(float size, FontStyle style)
     {
+        // Cached per size+style: ApplyControl re-themes every control on each
+        // theme apply, and each new Font is a GDI object that was never disposed.
+        string key = size.ToString("F1") + "|" + ((int)style).ToString();
+        Font cached;
+        lock (FontCache)
+        {
+            if (FontCache.TryGetValue(key, out cached)) return cached;
+        }
         string[] prefs = new string[] { "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI" };
         foreach (string name in prefs)
         {
-            try { return new Font(name, size, style, GraphicsUnit.Point); }
+            try
+            {
+                Font f = new Font(name, size, style, GraphicsUnit.Point);
+                lock (FontCache) FontCache[key] = f;
+                return f;
+            }
             catch { }
         }
-        return new Font(SystemFonts.MessageBoxFont.FontFamily, size, style);
+        Font fb = new Font(SystemFonts.MessageBoxFont.FontFamily, size, style);
+        lock (FontCache) FontCache[key] = fb;
+        return fb;
     }
+
+    private static readonly System.Collections.Generic.Dictionary<string, Font> FontCache =
+        new System.Collections.Generic.Dictionary<string, Font>();
 
     public static Font UiFont(float size)
     {
@@ -609,6 +635,9 @@ public static class AppTheme
         catch { }
     }
 
+    private static readonly DarkMenuRenderer CachedDarkRenderer = new DarkMenuRenderer();
+    private static readonly LightMenuRenderer CachedLightRenderer = new LightMenuRenderer();
+
     public static void ApplyMenu(ToolStrip menu, bool dark)
     {
         if (menu == null) return;
@@ -616,13 +645,13 @@ public static class AppTheme
         {
             if (dark)
             {
-                menu.Renderer = new DarkMenuRenderer();
+                menu.Renderer = CachedDarkRenderer;
                 menu.BackColor = DarkMenuBack;
                 menu.ForeColor = DarkFore;
             }
             else
             {
-                menu.Renderer = new LightMenuRenderer();
+                menu.Renderer = CachedLightRenderer;
                 menu.BackColor = LightMenuBack;
                 menu.ForeColor = LightFore;
             }

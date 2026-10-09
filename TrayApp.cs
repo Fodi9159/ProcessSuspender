@@ -22,6 +22,7 @@ public class TrayApp : ApplicationContext
     private SettingsForm _form;
     private Hotkeys _hotkeys;
     private InputHook _inputHook;
+    private Timer _hookSyncTimer;
 
     public TrayApp(bool showSettings)
     {
@@ -35,6 +36,23 @@ public class TrayApp : ApplicationContext
         _inputHook = new InputHook();
         _inputHook.SwitchStateChanged += delegate(bool active) { ProcessSuspenderApp.OnSwitchStateChanged(active); };
         _inputHook.MouseSwitchEvent += delegate(bool down, int x, int y) { ProcessSuspenderApp.OnMouseSwitchEvent(down, x, y); };
+        // On-demand mouse hook: installed only while something is frozen.
+        // A global WH_MOUSE_LL hook forces every mouse movement through this
+        // process; when idle (nothing frozen, freeze off) that context switch
+        // is pure cursor overhead. Runs on the UI thread so install/uninstall
+        // happens on the hook's owning thread.
+        _hookSyncTimer = new Timer();
+        _hookSyncTimer.Interval = 500;
+        _hookSyncTimer.Tick += delegate
+        {
+            try
+            {
+                bool want = ProcessSuspenderApp.Enabled && ProcessSuspenderApp.AnyFrozen;
+                if (_inputHook != null) _inputHook.SetMouseEnabled(want);
+            }
+            catch { }
+        };
+        _hookSyncTimer.Start();
         Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
         try { Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged; } catch { }
 
@@ -186,6 +204,14 @@ public class TrayApp : ApplicationContext
 
     private void RefreshLockedMenu()
     {
+        try
+        {
+            foreach (ToolStripItem old in _miLocked.DropDownItems)
+            {
+                try { old.Dispose(); } catch { }
+            }
+        }
+        catch { }
         _miLocked.DropDownItems.Clear();
         var entries = ProcessSuspenderApp.GetLockedWindows();
         if (entries.Count == 0)
@@ -309,6 +335,7 @@ public class TrayApp : ApplicationContext
     {
         try { Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch; } catch { }
         try { Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged; } catch { }
+        try { if (_hookSyncTimer != null) { _hookSyncTimer.Stop(); _hookSyncTimer.Dispose(); _hookSyncTimer = null; } } catch { }
         _icon.Visible = false;
         if (_icon != null) _icon.Dispose();
         if (_hotkeys != null) _hotkeys.Dispose();

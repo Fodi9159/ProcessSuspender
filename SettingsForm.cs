@@ -308,8 +308,9 @@ public class SettingsForm : Form
         _numEcoCap.DecimalPlaces = 1;
         _numEcoCap.Increment = 0.5m;
         Label lblCapHint = new Label();
-        lblCapHint.Text = "0.1\u2013100, default 2";
-        lblCapHint.Bounds = new Rectangle(278, 134, 200, 20);
+        lblCapHint.Text = "0.1\u2013100, default 2 (<5% can wedge games)";
+        lblCapHint.Bounds = new Rectangle(278, 134, 360, 20);
+        lblCapHint.AutoSize = true;
         grpBehavior.Controls.AddRange(new Control[] { lblPoll, _numPoll, lblMode, _rbSuspend, _rbEco, lblCap, _numEcoCap, lblCapHint });
 
         // ---- Card: System ----
@@ -441,7 +442,7 @@ public class SettingsForm : Form
         btnNeverRemove.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         btnNeverRemove.Click += delegate { RemoveNeverSuspend(); };
         Label lblNeverNote = new Label();
-        lblNeverNote.Text = "Matches the process name (\u201Cexplorer\u201D, \u201Cexplorer.exe\u201D). Services are covered by their host process (e.g. \u201Csvchost\u201D). Explorer is included by default.";
+        lblNeverNote.Text = "Matches the process name (\u201Cexplorer\u201D, \u201Cexplorer.exe\u201D). Services are covered by their host process (e.g. \u201Csvchost\u201D). Windows core, GPU driver and anti-cheat processes are included by default.";
         lblNeverNote.Bounds = new Rectangle(16, 362, 350, 50);
         lblNeverNote.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         card.Controls.AddRange(new Control[]
@@ -682,8 +683,20 @@ public class SettingsForm : Form
         if (_selectedPage != 1) return;
         string[] lines = ProcessSuspenderApp.GetLogLines();
         if (lines.Length == _lastLogCount) return;
+        if (_lastLogCount < 0 || lines.Length < _lastLogCount || _txtLog.TextLength == 0)
+        {
+            // Full rebuild: first view, buffer rollover, or cleared text.
+            _txtLog.Text = string.Join("\r\n", lines);
+        }
+        else
+        {
+            // Append only the delta instead of rebuilding the full buffer.
+            var sb = new System.Text.StringBuilder();
+            for (int i = _lastLogCount; i < lines.Length; i++)
+                sb.Append("\r\n").Append(lines[i]);
+            _txtLog.AppendText(sb.ToString());
+        }
         _lastLogCount = lines.Length;
-        _txtLog.Text = string.Join("\r\n", lines);
         _txtLog.SelectionStart = _txtLog.TextLength;
         _txtLog.ScrollToCaret();
     }

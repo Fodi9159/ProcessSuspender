@@ -68,11 +68,15 @@ public sealed class InputHook : IDisposable
     private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(uint vk);
 
     private IntPtr _kbdHook = IntPtr.Zero;
     private IntPtr _mouseHook = IntPtr.Zero;
     private readonly LLHookProc _kbdProc;
     private readonly LLHookProc _mouseProc;
+    private IntPtr _hookModule = IntPtr.Zero;
+    private bool _mouseEnabled = true;
     private readonly bool[] _keyDown = new bool[256];
     private bool _altDown;
     private bool _winDown;
@@ -91,6 +95,7 @@ public sealed class InputHook : IDisposable
                 mod = GetModuleHandle(m.ModuleName);
         }
         catch { }
+        _hookModule = mod;
         _kbdHook = SetWindowsHookEx(WH_KEYBOARD_LL, _kbdProc, mod, 0);
         _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, mod, 0);
         if (_kbdHook == IntPtr.Zero)
@@ -99,6 +104,37 @@ public sealed class InputHook : IDisposable
         if (_mouseHook == IntPtr.Zero)
             ProcessSuspenderApp.Log("[WARN] Mouse hook failed (err " + Marshal.GetLastWin32Error()
                 + ") - taskbar click auto-resume unavailable.");
+    }
+
+    /// <summary>
+    /// Enables or disables the global mouse hook. Must be called on the UI
+    /// thread (the thread that installed the hook). Disabling removes the
+    /// per-mousemove context switch into this process, which is the residual
+    /// cursor overhead when nothing is frozen. The keyboard hook stays installed
+    /// (key events are rare and carry no cursor cost).
+    /// </summary>
+    public void SetMouseEnabled(bool enable)
+    {
+        if (enable == _mouseEnabled) return;
+        _mouseEnabled = enable;
+        if (enable)
+        {
+            if (_mouseHook == IntPtr.Zero)
+            {
+                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, _hookModule, 0);
+                if (_mouseHook == IntPtr.Zero)
+                    ProcessSuspenderApp.Log("[WARN] Mouse hook reinstall failed (err " + Marshal.GetLastWin32Error() + ").");
+            }
+        }
+        else
+        {
+            if (_mouseHook != IntPtr.Zero)
+            {
+                try { UnhookWindowsHookEx(_mouseHook); }
+                catch { }
+                _mouseHook = IntPtr.Zero;
+            }
+        }
     }
 
     private IntPtr KbdProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -112,12 +148,15 @@ public sealed class InputHook : IDisposable
                 if (kb.vkCode < 256) _keyDown[kb.vkCode] = true;
                 if (IsAlt(kb.vkCode))
                 {
-                    if (!_altDown) _tabSinceAlt = false;
+                    // Fresh Alt hold: Tab must be pressed during THIS hold to count.
+                    // Seed from the physical Tab state so Tab-held-first still counts,
+                    // but a stale _keyDown[VK_TAB] can never fake a gesture.
+                    if (!_altDown) _tabSinceAlt = IsTabPhysicallyDown();
                     _altDown = true;
                 }
                 else if (IsWin(kb.vkCode))
                 {
-                    if (!_winDown) _tabSinceAlt = false;
+                    if (!_winDown) _tabSinceAlt = IsTabPhysicallyDown();
                     _winDown = true;
                 }
                 else if (kb.vkCode == VK_TAB && (_altDown || _winDown))
@@ -132,11 +171,19 @@ public sealed class InputHook : IDisposable
                 if (IsWin(kb.vkCode)) _winDown = false;
             }
 
+            HealStuckKeys();
+
+            bool modifierHeld = _altDown || _winDown;
+            // Gesture ends the moment the modifier is released: drop the latch so
+            // a missed key-up can never leave a stale true behind.
+            if (!modifierHeld) _tabSinceAlt = false;
+
             // Only treat the gesture as a window switch when Tab is used while Alt
             // or Win is held (a real Alt+Tab / Win+Tab). A stray Alt press (menus,
-            // shortcuts) must not unfreeze the game.
-            bool modifierHeld = _altDown || _winDown;
-            bool active = modifierHeld && (_keyDown[VK_TAB] || _tabSinceAlt);
+            // shortcuts) must not unfreeze the game. NOTE: deliberately NOT using
+            // _keyDown[VK_TAB] here - a stuck Tab entry (missed key-up) used to make
+            // every stray Alt press look like Alt+Tab (resume then re-suspend).
+            bool active = modifierHeld && _tabSinceAlt;
             if (active != _lastSwitch)
             {
                 _lastSwitch = active;
@@ -144,6 +191,48 @@ public sealed class InputHook : IDisposable
             }
         }
         return CallNextHookEx(_kbdHook, nCode, wParam, lParam);
+    }
+
+    /// <summary>
+    /// Self-heal keys stuck by a missed key-up (hook drop, nCode&lt;0 skip).
+    /// GetAsyncKeyState is a fast syscall and safe on the hook thread.
+    /// </summary>
+    private void HealStuckKeys()
+    {
+        try
+        {
+            if (_keyDown[VK_TAB] && !IsTabPhysicallyDown()) _keyDown[VK_TAB] = false;
+            if (_altDown && !IsAltPhysicallyDown()) _altDown = false;
+            if (_winDown && !IsWinPhysicallyDown()) _winDown = false;
+        }
+        catch { }
+    }
+
+    private static bool IsTabPhysicallyDown()
+    {
+        try { return (GetAsyncKeyState(VK_TAB) & 0x8000) != 0; }
+        catch { return false; }
+    }
+
+    private static bool IsAltPhysicallyDown()
+    {
+        try
+        {
+            return ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0)
+                || ((GetAsyncKeyState(VK_LMENU) & 0x8000) != 0)
+                || ((GetAsyncKeyState(VK_RMENU) & 0x8000) != 0);
+        }
+        catch { return true; } // on error keep cached state (don't force-clear)
+    }
+
+    private static bool IsWinPhysicallyDown()
+    {
+        try
+        {
+            return ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0)
+                || ((GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
+        }
+        catch { return true; }
     }
 
     private static bool IsAlt(uint vk)

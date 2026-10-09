@@ -66,7 +66,9 @@ All settings apply live from the Settings window - no restart needed.
 - `FreezeMode` - `"Suspend"` (NtSuspendProcess, ~0% CPU) or `"Eco"` (low-power:
   IDLE priority + EcoQoS + CPU cap, game keeps running). Switch in tray ->
   Freeze mode or Settings -> Behavior.
-- `EcoCpuCapPercent` - CPU hard cap percent for Eco mode (0.1-100, default 2; 0.5 = half a percent)
+- `EcoCpuCapPercent` - CPU hard cap percent for Eco mode (0.1-100, default 2; 0.5 = half a percent).
+  Below ~5% can permanently wedge fragile games (they never recover even after restore) -
+  prefer 5%+ or Suspend mode for games.
 - `ResumeOnExit` - resume/restore targets when Process Suspender exits (default true)
 - `AutoStartWithWindows` - register in `HKCU\...\Run`
 - `LogToFile` - append `focuslock.log` next to the config
@@ -74,7 +76,10 @@ All settings apply live from the Settings window - no restart needed.
   Appearance or Settings -> System -> Appearance. Window, tray menu, picker and
   toasts follow the Windows app theme live when set to `System`.
 - `NeverSuspend` - whitelist of process names that are never locked or suspended
-  (e.g. `["explorer"]`; `explorer` is included by default). Manage it in
+  (defaults: `explorer`, `dwm`, `csrss`, `wininit`, `services`, `svchost`,
+  `lsass`, `smss`, `winlogon`, `fontdrvhost`, `amdow`, `amdfendrsr`,
+  `atiesrxx`, `nvcontainer`, `nvdisplay.container`, `easyanticheat`,
+  `battleye`, `vgc`, `vgcmda`). Manage it in
   Settings -> Never suspend. Matches the process name, so services are covered by
   their host process (add `svchost` to whitelist all services in it).
 
@@ -89,7 +94,8 @@ refuses to lock or suspend, enforced at every entry point:
 - the worker never suspends a whitelisted PID even if it was targeted before the
   entry was added, and applying the list immediately resumes any whitelisted
   process that was suspended,
-- `explorer` ships in the list by default; add or remove entries in Settings, no
+- `explorer` and other critical Windows, GPU driver and anti-cheat processes ship
+  in the list by default; add or remove entries in Settings, no
   restart needed.
 
 Services are whitelisted by their host process name (e.g. `svchost`). Whitelisting

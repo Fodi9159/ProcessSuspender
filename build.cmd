@@ -6,8 +6,12 @@ if %errorlevel%==0 (
     dotnet build ProcessSuspender.csproj -c Release --nologo -v q
     if %errorlevel%==0 (
         copy /y "bin\Release\net48\ProcessSuspender.exe" "ProcessSuspender.exe" >nul
-        echo Built ProcessSuspender.exe via dotnet.
-        exit /b 0
+        if %errorlevel%==0 (
+            rmdir /s /q bin >nul 2>nul
+            rmdir /s /q obj >nul 2>nul
+            echo Built ProcessSuspender.exe via dotnet.
+            exit /b 0
+        )
     )
     echo dotnet build failed, falling back to csc.exe...
 )

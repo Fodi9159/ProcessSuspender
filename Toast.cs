@@ -112,6 +112,15 @@ internal static class Toast
             {
                 Opacity = 1.0;
                 _ticks = 0;
+                try
+                {
+                    using (GraphicsPath path = AppTheme.RoundedRect(new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height)), 8))
+                    {
+                        if (Region != null) { try { Region.Dispose(); } catch { } }
+                        Region = new Region(path);
+                    }
+                }
+                catch { }
                 _timer.Start();
             };
         }
@@ -127,7 +136,6 @@ internal static class Toast
                 Color border = _dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(225, 225, 225);
                 using (GraphicsPath path = AppTheme.RoundedRect(new Rectangle(0, 0, Width, Height), 8))
                 {
-                    Region = new Region(path);
                     using (SolidBrush br = new SolidBrush(fill))
                         g.FillPath(br, path);
                     using (Pen pen = new Pen(border, 1f))

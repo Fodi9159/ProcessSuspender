@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -57,8 +56,6 @@ public static class ProcessSuspenderApp
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder path, ref uint size);
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr h);
     // ---- Eco / low-power mode ----
@@ -74,10 +71,10 @@ public static class ProcessSuspenderApp
     private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOB_CPU_RATE_CONTROL info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, ref JOB_CPU_RATE_CONTROL info, uint size, out uint returned);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
-    [DllImport("psapi.dll", SetLastError = true)]
-    private static extern bool EmptyWorkingSet(IntPtr h);
 
     private const uint IDLE_PRIORITY_CLASS = 0x0040;
     private const uint NORMAL_PRIORITY_CLASS = 0x0020;
@@ -133,15 +130,6 @@ public static class ProcessSuspenderApp
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
 
-    [DllImport("user32.dll")]
-    private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")]
-    private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, ref RECT lParam);
-    [DllImport("user32.dll")]
-    private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, ref TBBUTTON lParam);
-    [DllImport("user32.dll")]
-    private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
-
     public static void SetDpiAware()
     {
         try { SetProcessDPIAware(); } catch { }
@@ -152,26 +140,6 @@ public static class ProcessSuspenderApp
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct POINT { public int X; public int Y; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct TBBUTTON
-    {
-        public int iBitmap;
-        public int idCommand;
-        public byte fsState;
-        public byte fsStyle;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
-        public byte[] bReserved;
-        public IntPtr dwData;
-        public IntPtr iString;
-    }
-
-    private const uint TB_BUTTONCOUNT = 0x0418;
-    private const uint TB_GETBUTTON = 0x0417;
-    private const uint TB_GETITEMRECT = 0x041D;
 
     private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
@@ -186,6 +154,21 @@ public static class ProcessSuspenderApp
     private static readonly HashSet<int> Minimized = new HashSet<int>();
     private static readonly HashSet<int> WarnedPids = new HashSet<int>();
     private static readonly HashSet<int> WarnedResumePids = new HashSet<int>();
+    private static readonly HashSet<int> WarnedEcoRestorePids = new HashSet<int>();
+    // Anti-flap: throttle only after a stable defocus, and never right after
+    // a restore. Switch animations flicker foreground game->explorer->game
+    // across ticks; throttling the first transient tick starves the game
+    // again before it paints a frame (DWM "Not Responding" death spiral).
+    // Restore stays immediate (one tick).
+    private static readonly Dictionary<int, DateTime> unfocusedSince = new Dictionary<int, DateTime>();
+    private static readonly Dictionary<int, DateTime> lastRestoreAt = new Dictionary<int, DateTime>();
+    private const int ThrottleDelayMs = 750;
+    private const int RestoreRecoveryMs = 2500;
+    // Handle tier tracking: a PROCESS_MINIMAL fallback handle cannot set
+    // priority, EcoQoS or job caps, so Eco on it would be a silent no-op.
+    private static readonly HashSet<int> MinimalHandles = new HashSet<int>();
+    private static readonly HashSet<int> WarnedMinimalEco = new HashSet<int>();
+    private static readonly HashSet<int> WarnedLowCap = new HashSet<int>();
     private static readonly HashSet<int> FocusedNow = new HashSet<int>();
     private static uint lastFgPid;
     private static DateTime lastNameRefresh = DateTime.MinValue;
@@ -194,6 +177,21 @@ public static class ProcessSuspenderApp
     private static DateTime lastHookCache = DateTime.MinValue;
     private static DateTime lastAudioRemute = DateTime.MinValue;
     private static volatile bool pendingForegroundSuspend;
+    // Async resume: the low-level hooks must never block on NtResume/Eco/COM.
+    // Hooks only set this flag + timestamp and queue background work; the
+    // ThreadPool worker (and the poll worker as fallback) does the real resume.
+    private static volatile bool pendingResume;
+    private static readonly object PendingResumeLock = new object();
+    private static string pendingResumeReason = "";
+    // Hook-safe taskbar rects: worker refreshes, hook only reads (no EnumWindows
+    // on the hook thread - that scan stalls all mouse input).
+    private static readonly List<RECT> hookTaskbarRects = new List<RECT>();
+    // Hook-safe system-area rects (Start button, notification area with tray +
+    // clock): worker refreshes, hook only reads. Clicks here can never activate
+    // the target, so they must never resume it - even when the taskbar-button
+    // cache is empty/stale and the fallback below would otherwise wake the game
+    // on every Start click.
+    private static readonly List<RECT> hookSystemRects = new List<RECT>();
     // Cheap hook cache refreshed by the worker: the mouse hook must never do
     // Process enumeration or UIA walks (Windows drops slow low-level hooks).
     private static readonly List<IntPtr> hookTargetHwnds = new List<IntPtr>();
@@ -252,6 +250,13 @@ public static class ProcessSuspenderApp
     // the cache may be incomplete. The hook then falls back to resume-on-click
     // (safer than leaving the game stuck) and logs the fallback reason.
     private static volatile bool taskbarButtonsStale = true;
+    /// <summary>
+    /// True when the target's own taskbar button is currently in the enumerated
+    /// button cache (worker refreshes, hook only reads). Lets the hook ignore
+    /// clicks that hit no button (Start, tray, clock, gaps) even while the
+    /// cache is otherwise stale, instead of resuming first.
+    /// </summary>
+    private static volatile bool hookTargetButtonPresent;
     private static string lastTrayCacheLog = "";
 
     private sealed class TrayButtonInfo
@@ -317,6 +322,28 @@ public static class ProcessSuspenderApp
     private static bool IsFrozenLocked(int pid)
     {
         return Suspended.Contains(pid) || Throttled.Contains(pid);
+    }
+
+    /// <summary>
+    /// True when any target is currently frozen. Never blocks: uses TryEnter so
+    /// a UI-thread caller (hook sync timer) can never stall on the worker's
+    /// long StateLock hold. On contention returns true (conservative: keep the
+    /// mouse hook installed rather than risk missing a click-back).
+    /// </summary>
+    public static bool AnyFrozen
+    {
+        get
+        {
+            bool took = false;
+            try
+            {
+                took = Monitor.TryEnter(StateLock, 0);
+                if (took) return Suspended.Count + Throttled.Count > 0;
+            }
+            catch { }
+            finally { if (took) Monitor.Exit(StateLock); }
+            return true;
+        }
     }
 
     public static string CurrentTargetDescription
@@ -503,6 +530,7 @@ public static class ProcessSuspenderApp
     {
         Config = SettingsStore.Load();
         if (Config.NeverSuspend == null) Config.NeverSuspend = new List<string>();
+        Settings.EnsureDefaults(Config.NeverSuspend);
         if (Config.LockedProcesses == null) Config.LockedProcesses = new List<string>();
         logToFile = Config.LogToFile;
         pollMs = Config.PollIntervalMsClamped;
@@ -518,6 +546,10 @@ public static class ProcessSuspenderApp
     public static void Start()
     {
         running = true;
+        // Warm the hook caches synchronously so clicks in the first seconds
+        // (tray mode probe + taskbar/system rects) don't hit empty fallbacks.
+        try { RefreshHookTaskbarRects(); } catch { }
+        try { RefreshTaskbarButtons(); } catch { }
         worker = new Thread(WorkerLoop);
         worker.IsBackground = true;
         worker.Name = "ProcessSuspenderWorker";
@@ -904,8 +936,11 @@ public static class ProcessSuspenderApp
 
     /// <summary>
     /// The user pressed or released Alt+Tab / Win+Tab (a real switch gesture, as
-    /// detected by the keyboard hook). Resume on gesture END must stay synchronous
-    /// (the hook sees key-up before the shell activates, so resume lands first).
+    /// detected by the keyboard hook). Both directions are now async: the hook
+    /// only flips flags, the resume runs on a background thread so a slow
+    /// NtResume/Eco-restore can never stall global keyboard/mouse input.
+    /// Resume still lands within milliseconds, well before the shell finishes
+    /// activating the target window.
     /// Suspend on gesture START is deferred to the worker: NtSuspend inside the
     /// low-level hook would stall the switcher UI.
     /// </summary>
@@ -920,8 +955,45 @@ public static class ProcessSuspenderApp
         else
         {
             pendingForegroundSuspend = false;
-            ResumeSuspended("switch gesture released");
+            // Async: never block the low-level hook on resume work.
+            RequestResumeAsync("switch gesture released");
         }
+    }
+
+    /// <summary>
+    /// Hooks call this (microseconds): record the request and resume on a
+    /// ThreadPool thread. The poll worker also drains it as a fallback.
+    /// </summary>
+    private static void RequestResumeAsync(string reason)
+    {
+        lock (PendingResumeLock)
+        {
+            pendingResumeReason = reason;
+            pendingResume = true;
+        }
+        try
+        {
+            ThreadPool.QueueUserWorkItem(delegate(object unused)
+            {
+                try { DrainPendingResume(); }
+                catch { }
+            });
+        }
+        catch { }
+    }
+
+    private static void DrainPendingResume()
+    {
+        string reason;
+        lock (PendingResumeLock)
+        {
+            if (!pendingResume) return;
+            pendingResume = false;
+            reason = pendingResumeReason;
+            pendingResumeReason = "";
+        }
+        try { ResumeSuspended(reason); }
+        catch { }
     }
 
     /// <summary>Suspends (or Eco-throttles) any locked target that still owns the foreground window.
@@ -963,16 +1035,28 @@ public static class ProcessSuspenderApp
     /// <summary>
     /// Left mouse button down/up. Fast path only: the low-level mouse hook must
     /// return in microseconds (Windows drops slow hooks). No Process enumeration,
-    /// no UIA, no title matching here - just cached rects/handles. Only the
-    /// target's own taskbar button (or its window) resumes it; clicks elsewhere
-    /// are ignored so a suspended game stays frozen.
+    /// no UIA, no EnumWindows, no logging here - just cached rects/handles.
+    /// Only the target's own taskbar button (or its window) resumes it; clicks
+    /// elsewhere are ignored so a suspended game stays frozen. Resume itself
+    /// runs on a background thread (see RequestResumeAsync).
     /// </summary>
     public static void OnMouseSwitchEvent(bool down, int x, int y)
     {
         if (down)
         {
-            bool anyFrozen;
-            lock (StateLock) anyFrozen = Suspended.Count + Throttled.Count > 0;
+            // Never block the hook on StateLock: the worker can hold it for
+            // 10-100ms across NtSuspend/COM. If the lock is busy, assume
+            // frozen (conservative) and do the cheap hit test.
+            bool anyFrozen = true;
+            bool tookLock = false;
+            try
+            {
+                tookLock = Monitor.TryEnter(StateLock, 0);
+                if (tookLock)
+                    anyFrozen = Suspended.Count + Throttled.Count > 0;
+            }
+            catch { anyFrozen = true; }
+            finally { if (tookLock) Monitor.Exit(StateLock); }
             if (!anyFrozen)
             {
                 mouseSwitching = true;
@@ -980,12 +1064,13 @@ public static class ProcessSuspenderApp
                 lastSwitchActivity = DateTime.UtcNow;
                 return;
             }
-            bool isSwitch = CheapSwitchHit(x, y);
+            string match;
+            bool isSwitch = CheapSwitchHit(x, y, out match);
             mouseDownWasSwitch = isSwitch;
             if (!isSwitch) return;
             mouseSwitching = true;
             lastSwitchActivity = DateTime.UtcNow;
-            ResumeSuspended("mouse click on target/taskbar");
+            RequestResumeAsync("mouse click on target/taskbar (" + match + " at " + x + "," + y + ")");
             return;
         }
         mouseSwitching = false;
@@ -997,12 +1082,21 @@ public static class ProcessSuspenderApp
     }
 
     /// <summary>Cheap hook-safe hit test using only cached data + WindowFromPoint.</summary>
-    private static bool CheapSwitchHit(int x, int y)
+    private static bool CheapSwitchHit(int x, int y, out string match)
     {
+        match = "";
         bool inTaskbar = false;
-        try { inTaskbar = IsInTaskbar(x, y); }
+        try { inTaskbar = IsInTaskbarCached(x, y); }
         catch { inTaskbar = false; }
-        if (inTaskbar) return CheapTaskbarHit(x, y);
+        if (inTaskbar)
+        {
+            // Start button / tray / clock can never activate the target: ignore
+            // before any fallback (Unknown/Legacy mode, stale or empty button
+            // cache) gets a chance to treat them as a switch-back attempt.
+            try { if (IsInSystemAreaCached(x, y)) { match = ""; return false; } }
+            catch { }
+            return CheapTaskbarHit(x, y, out match);
+        }
         try
         {
             if (PointInsideForegroundWindow(x, y)) return false;
@@ -1010,46 +1104,45 @@ public static class ProcessSuspenderApp
         catch { }
         IntPtr hit = IntPtr.Zero;
         try { hit = WindowFromPoint(x, y); }
-        catch { return false; }
-        if (hit == IntPtr.Zero) return false;
+        catch { match = ""; return false; }
+        if (hit == IntPtr.Zero) { match = ""; return false; }
         lock (HookCacheLock)
         {
             foreach (IntPtr hw in hookTargetHwnds)
             {
-                if (hit == hw) return true;
-                try { if (IsChild(hw, hit)) return true; }
+                if (hit == hw) { match = "target window"; return true; }
+                try { if (IsChild(hw, hit)) { match = "target window"; return true; } }
                 catch { }
             }
             foreach (IntPtr mw in hookTargetMains)
             {
-                if (hit == mw) return true;
-                try { if (IsChild(mw, hit)) return true; }
+                if (hit == mw) { match = "target window"; return true; }
+                try { if (IsChild(mw, hit)) { match = "target window"; return true; } }
                 catch { }
             }
         }
+        match = "";
         return false;
     }
 
     /// <summary>
-    /// Hook-safe taskbar hit test. Only a click on the target's own taskbar button
-    /// resumes it. Clicks on other apps' buttons, the tray, clock, Start, search or
-    /// empty gaps return false so a suspended game stays frozen. Uses only data the
-    /// worker cached (button rects + target exe/title); never touches Process or UIA.
-    /// When the environment cannot be probed (Legacy/Unknown mode), the button
-    /// cache is incomplete, or the target identity is unverifiable, returns true to
-    /// preserve the old resume-first behaviour and avoid a stuck suspended game.
-    /// Every verdict while suspended is logged (with its reason) so a wrong resume
-    /// can be traced in focuslock.log.
+    /// Hook-safe taskbar hit test. Whenever any button data is cached, only a
+    /// click on the target's own taskbar button resumes it - in every tray mode,
+    /// stale or not. Clicks on other apps' buttons, the tray, clock, Start,
+    /// Search or empty gaps return false so a suspended game stays frozen. Uses
+    /// only data the worker cached (button rects + target exe/title); never
+    /// touches Process, UIA, EnumWindows or Log (all would stall the low-level
+    /// hook). Only when no button data exists at all (Legacy/Unknown mode with
+    /// an empty cache, or the target identity is unverifiable) does it return
+    /// true, preserving resume-first so a click never leaves the game stuck.
+    /// The out match string describes the verdict; the background resume thread
+    /// logs it (hook thread never logs).
     /// </summary>
-    private static bool CheapTaskbarHit(int x, int y)
+    private static bool CheapTaskbarHit(int x, int y, out string match)
     {
-        if (trayMode == TrayMode.Legacy || trayMode == TrayMode.Unknown)
-        {
-            Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: tray mode " + trayMode + ")");
-            return true;
-        }
         TrayButtonInfo hit = null;
         int buttonCount = 0;
+        bool nearButton = false;
         bool stale;
         lock (taskbarButtons)
         {
@@ -1058,17 +1151,36 @@ public static class ProcessSuspenderApp
             {
                 if (b.Contains(x, y)) { hit = b; break; }
             }
+            // Is the click at least close to a known button? Adjacent buttons
+            // touch, so a click far from every cached button (Start, tray,
+            // clock, screen edges) cannot be a switch-back - even when the
+            // cache is stale. A missed (unenumerated) button sits next to known
+            // ones, so it stays inside the margin and keeps resume-first.
+            if (hit == null && buttonCount > 0)
+            {
+                foreach (TrayButtonInfo b in taskbarButtons)
+                {
+                    if (x >= b.Left - 16 && x <= b.Right + 16
+                        && y >= b.Top - 16 && y <= b.Bottom + 16)
+                    { nearButton = true; break; }
+                }
+            }
         }
         stale = taskbarButtonsStale;
-        if (hit == null)
+        if (buttonCount > 0)
         {
-            if (buttonCount == 0 || stale)
+            if (hit == null)
             {
-                Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: buttons=" + buttonCount + ", stale=" + stale + ")");
-                return true; // enumeration failed or incomplete: cannot tell, resume to be safe
+                // The target's own button is currently enumerated: a click matching
+                // no button is definitively not the target (Start, tray, clock,
+                // gaps...), even when the cache is otherwise stale (e.g. a failed
+                // secondary-monitor bar). Stale alone must not wake the game.
+                if (hookTargetButtonPresent) { match = ""; return false; }
+                if (!nearButton) { match = ""; return false; }
+                if (!stale) { match = ""; return false; }
+                match = "fallback near-button while stale";
+                return true;
             }
-            return false; // gap, tray, clock, Start, Search: never activates the target
-        }
         List<string> exeList;
         List<string> titleList;
         lock (HookCacheLock)
@@ -1080,11 +1192,55 @@ public static class ProcessSuspenderApp
         bool haveTitle = titleList.Count > 0;
         if (!haveExe && !haveTitle)
         {
-            Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: target identity unknown)");
+            match = "fallback target identity unknown";
             return true; // target identity unknown: resume to be safe
         }
-        string btnName = hit.Name ?? "";
-        string btnApp = hit.AppPath ?? "";
+        // Copy button strings while holding the lock, then match outside it so
+        // the hook never blocks on the worker's UIA walk.
+        string btnName, btnApp;
+        lock (taskbarButtons)
+        {
+            btnName = hit.Name ?? "";
+            btnApp = hit.AppPath ?? "";
+        }
+        string verdict = MatchButtonToTarget(btnName, btnApp, exeList, titleList);
+        if (verdict == "appid")
+        {
+            match = "target button appid match";
+            return true;
+        }
+        if (verdict == "title")
+        {
+            match = "target button title match";
+            return true;
+        }
+        if (verdict == null)
+        {
+            match = "";
+            return false; // button of a different app: definitely not ours
+        }
+        // Button could not be mapped (no AppPath, no usable name): treat as
+        // potential target so a click never leaves the game stuck suspended.
+        match = "fallback unmappable button";
+        return true;
+        }
+        // No button data at all (Legacy/Unknown mode with an empty cache, or a
+        // totally failed enumeration): buttons cannot be told apart, so resume
+        // first and let the worker re-suspend if the click was not a switch-back.
+        match = "fallback buttons=" + buttonCount + " stale=" + stale + " trayMode=" + trayMode;
+        return true;
+    }
+
+    /// <summary>
+    /// Pure button-vs-target matcher shared by the hook and the worker's
+    /// target-presence check. Returns "appid"/"title" when the button belongs
+    /// to the target, null when it definitively belongs to another app, and
+    /// "unknown" when it cannot be mapped. No locks, no syscalls.
+    /// </summary>
+    private static string MatchButtonToTarget(string btnName, string btnApp, List<string> exeList, List<string> titleList)
+    {
+        bool haveExe = exeList != null && exeList.Count > 0;
+        bool haveTitle = titleList != null && titleList.Count > 0;
         // (1) exe/AppId match. Most Win11 AutomationIds are opaque AppUserModelIds
         // ("Chrome", "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App") rather than exe
         // paths, so only a path-like AppId that fails to match is definitive proof
@@ -1111,16 +1267,8 @@ public static class ProcessSuspenderApp
                     if (noExt.Length > 0 && (p == noExt || p.EndsWith("/" + noExt, StringComparison.Ordinal)))
                     { matched = true; break; }
                 }
-                if (matched)
-                {
-                    Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume: target button (appid match \"" + Shorten(btnApp) + "\")");
-                    return true;
-                }
-                if (pathLike)
-                {
-                    Log("[MOUSE] taskbar click at (" + x + "," + y + ") ignored: other app button \"" + Shorten(btnName) + "\"");
-                    return false; // path AppId of a different app: definitely not ours
-                }
+                if (matched) return "appid";
+                if (pathLike) return null; // path AppId of a different app: definitely not ours
                 // opaque AppId with no exe-name match: undecided, try title below
             }
         }
@@ -1137,31 +1285,14 @@ public static class ProcessSuspenderApp
                     if (t.Length == 0) continue;
                     int overlap = Math.Min(n.Length, t.Length);
                     if (overlap >= 3 && (n.StartsWith(t, StringComparison.Ordinal) || t.StartsWith(n, StringComparison.Ordinal)))
-                    {
-                        Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume: target button (title match \"" + Shorten(btnName) + "\")");
-                        return true;
-                    }
+                        return "title";
                     if (n.Equals(t, StringComparison.Ordinal))
-                    {
-                        Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume: target button (title match \"" + Shorten(btnName) + "\")");
-                        return true;
-                    }
+                        return "title";
                 }
-                Log("[MOUSE] taskbar click at (" + x + "," + y + ") ignored: other app button \"" + Shorten(btnName) + "\"");
-                return false;
+                return null;
             }
         }
-        // Button could not be mapped (no AppPath, no usable name): treat as
-        // potential target so a click never leaves the game stuck suspended.
-        Log("[MOUSE] taskbar click at (" + x + "," + y + ") resume (fallback: unmappable button name=\"" + Shorten(btnName) + "\" appid=\"" + Shorten(btnApp) + "\")");
-        return true;
-    }
-
-    private static string Shorten(string s)
-    {
-        if (s == null) return "";
-        s = s.Trim();
-        return s.Length > 60 ? s.Substring(0, 60) + "..." : s;
+        return "unknown";
     }
 
     /// <summary>Refreshed by the worker (not the hook): cheap cache for CheapSwitchHit.</summary>
@@ -1169,7 +1300,26 @@ public static class ProcessSuspenderApp
     {
         if ((DateTime.UtcNow - lastHookCache).TotalMilliseconds < 1000) return;
         lastHookCache = DateTime.UtcNow;
+        // Fully idle (no targets, nothing frozen): the mouse hook is uninstalled
+        // so none of this data is read. Skip the UIA walk / EnumWindows /
+        // process queries entirely instead of paying them every second.
+        bool idle = false;
+        try
+        {
+            bool took = false;
+            try
+            {
+                took = Monitor.TryEnter(StateLock, 0);
+                if (took)
+                    idle = targetName == null && WindowTargets.Count == 0
+                        && Suspended.Count == 0 && Throttled.Count == 0;
+            }
+            finally { if (took) Monitor.Exit(StateLock); }
+        }
+        catch { idle = false; }
+        if (idle) return;
         try { RefreshTaskbarButtons(); } catch { }
+        try { RefreshHookTaskbarRects(); } catch { }
         List<IntPtr> hwnds = new List<IntPtr>();
         List<IntPtr> mains = new List<IntPtr>();
         string nameCopy = null;
@@ -1290,6 +1440,25 @@ public static class ProcessSuspenderApp
             }
         }
         catch { }
+        // Is the target's own button in the current cache? Snapshot the buttons
+        // without nesting locks (taskbarButtons -> compare -> volatile write),
+        // so the hook never blocks on the worker's UIA walk.
+        bool present = false;
+        try
+        {
+            if (exes.Count > 0 || titles.Count > 0)
+            {
+                List<TrayButtonInfo> btnCopy;
+                lock (taskbarButtons) btnCopy = new List<TrayButtonInfo>(taskbarButtons);
+                foreach (TrayButtonInfo b in btnCopy)
+                {
+                    if (MatchButtonToTarget(b.Name ?? "", b.AppPath ?? "", exes, titles) != null)
+                    { present = true; break; }
+                }
+            }
+        }
+        catch { }
+        hookTargetButtonPresent = present;
         lock (HookCacheLock)
         {
             hookTargetExePaths.Clear();
@@ -1310,6 +1479,7 @@ public static class ProcessSuspenderApp
                 if (Handles.TryGetValue(pid, out h) && ResumeFully(h))
                 {
                     Suspended.Remove(pid);
+                    lastRestoreAt[pid] = DateTime.UtcNow;
                     Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ") - " + reason);
                 }
             }
@@ -1319,6 +1489,7 @@ public static class ProcessSuspenderApp
                 if (Handles.TryGetValue(pid, out h))
                 {
                     RestoreEcoLocked(pid, h);
+                    lastRestoreAt[pid] = DateTime.UtcNow;
                     Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ") - " + reason);
                 }
             }
@@ -1365,78 +1536,6 @@ public static class ProcessSuspenderApp
         }
     }
 
-    /// <summary>
-    /// Returns a short reason string when the click at (x, y) is treated as a
-    /// switch back to the target (so the log says what matched), else null.
-    /// A click counts only over the target's taskbar button or directly over the
-    /// target window - and never when it lands inside the currently focused
-    /// window: the user is using that window, not returning to the game, even if
-    /// the hit test fell through to the game window behind it (transparent or
-    /// disabled regions, coordinate quirks). Nor when the click is on a
-    /// fullscreen/maximized target that is just the backdrop behind the window
-    /// the user is actually working in.
-    /// </summary>
-    private static string SwitchAreaReason(int x, int y)
-    {
-        if (IsInTaskbar(x, y))
-        {
-            string tb = TaskbarClickReason(x, y);
-            if (tb != null) return tb;
-        }
-        IntPtr hit = WindowFromPoint(x, y);
-        if (hit == IntPtr.Zero) return null;
-        if (PointInsideForegroundWindow(x, y)) return null;
-
-        // Snapshot under lock; the matching below enumerates processes and reads
-        // window state, which must not run while holding StateLock on the hook thread.
-        List<WindowTarget> targets;
-        string name;
-        lock (StateLock)
-        {
-            targets = WindowTargets.ToList();
-            name = targetName;
-        }
-
-        if (targets.Count > 0)
-        {
-            foreach (WindowTarget t in targets)
-            {
-                if (hit == t.Hwnd || IsChild(t.Hwnd, hit))
-                {
-                    // ponytail: don't treat a suspended locked target visible behind
-                    // another window as backdrop — user clicking it wants it back.
-                    return "click on target window";
-                }
-            }
-            return null;
-        }
-        if (name == null) return null;
-        // Only the process's main window(s) - and their children - count as
-        // a switch-back target. A second window of the game process (a
-        // launcher, a companion window) must not unfreeze the game.
-        try
-        {
-            Process[] list = Process.GetProcessesByName(name);
-            foreach (Process p in list)
-            {
-                try
-                {
-                    IntPtr mw = p.MainWindowHandle;
-                    if (mw == IntPtr.Zero) continue;
-                    if (hit == mw || IsChild(mw, hit))
-                    {
-                        if (!IsWindowVisible(hit)) return null;
-                        if (IsBackdropClick(x, y, mw)) return null;
-                        return "click on target window";
-                    }
-                }
-                finally { try { p.Dispose(); } catch { } }
-            }
-        }
-        catch { }
-        return null;
-    }
-
     /// <summary>True when (x, y) lies within the rectangle of the currently focused window.</summary>
     private static bool PointInsideForegroundWindow(int x, int y)
     {
@@ -1445,152 +1544,6 @@ public static class ProcessSuspenderApp
         RECT r;
         if (!GetWindowRect(fg, out r)) return false;
         return x >= r.Left && x <= r.Right && y >= r.Top && y <= r.Bottom;
-    }
-
-    /// <summary>
-    /// True when the click at (x, y) is on a fullscreen/maximized target that is
-    /// merely the backdrop behind the window the user is actually using: the
-    /// target fills the same monitor as the focused window, and the focused
-    /// window belongs to another process. Clicking such a target's visible
-    /// slivers is accidental - the user is working in the other window, not
-    /// returning to the game - so it must not unfreeze it.
-    /// </summary>
-    private static bool IsBackdropClick(int x, int y, IntPtr target)
-    {
-        if (!CoversMonitor(target)) return false;
-        IntPtr fg = GetForegroundWindow();
-        if (fg == IntPtr.Zero || fg == target) return false;
-        uint fgPid, tPid;
-        GetWindowThreadProcessId(fg, out fgPid);
-        GetWindowThreadProcessId(target, out tPid);
-        if (fgPid == tPid) return false;
-        RECT r;
-        if (!GetWindowRect(fg, out r)) return false;
-        Screen fgScreen = Screen.FromPoint(new Point(r.Left + (r.Right - r.Left) / 2, r.Top + (r.Bottom - r.Top) / 2));
-        Screen clickScreen = Screen.FromPoint(new Point(x, y));
-        return fgScreen != null && clickScreen != null && fgScreen.Equals(clickScreen);
-    }
-
-    /// <summary>True when the window covers nearly a whole monitor (fullscreen or maximized).</summary>
-    private static bool CoversMonitor(IntPtr hwnd)
-    {
-        RECT r;
-        if (!GetWindowRect(hwnd, out r)) return false;
-        Screen sc = Screen.FromHandle(hwnd);
-        if (sc == null) return false;
-        var b = sc.Bounds;
-        return (r.Right - r.Left) >= b.Width - 64 && (r.Bottom - r.Top) >= b.Height - 64;
-    }
-
-    /// <summary>
-    /// Decides whether a click inside a taskbar counts as "switch back to the target".
-    /// Tries, in order: (1) title match against enumerated taskbar buttons (trimmed,
-    /// suffix-tolerant - works when the button label is clipped or has Win10's
-    /// " - N running windows" / " pinned" suffixes), (2) a title-independent match via
-    /// the Win10 taskbar toolbar button's dwData -> PID (only exists on Win7/8-style
-    /// toolbars; on XAML/DComposition Win10 taskbars there is no ToolbarWindow32 and
-    /// no window per button, so this is a no-op there), (3) a last-resort region
-    /// fallback: on modern Win10 taskbars a frozen window's button cannot be mapped
-    /// to a pid by any API (UIA peers report explorer's pid, names are app names not
-    /// window titles), so a click inside the taskbar's button region while at least
-    /// one process is suspended counts as a switch-back attempt - the worker poll
-    /// re-suspends within the grace window if the user actually clicked another app.
-    /// </summary>
-    private static string TaskbarClickReason(int x, int y)
-    {
-        RefreshTaskbarButtons();
-        if (trayMode == TrayMode.Legacy) return "taskbar click (compat mode)"; // environment not detectable: old behaviour
-
-        string title = GetTargetTitle();
-
-        // (1) strict title match, tolerant of trailing spaces, clipped labels and
-        //     Win10 button-name suffixes (" - 1 running window", " pinned").
-        if (title.Length > 0)
-        {
-            string t = title.Trim();
-            lock (taskbarButtons)
-            {
-                for (int i = 0; i < taskbarButtons.Count; i++)
-                {
-                    TrayButtonInfo b = taskbarButtons[i];
-                    if (!b.Contains(x, y)) continue;
-                    string n = StripButtonSuffixes(b.Name).Trim();
-                    if (n.Length > 0 &&
-                        (n.StartsWith(t, StringComparison.OrdinalIgnoreCase) ||
-                         t.StartsWith(n, StringComparison.OrdinalIgnoreCase)))
-                        return "taskbar click";
-                }
-            }
-        }
-
-        // (2) title-independent match via toolbar button dwData (Win7/8 style taskbars).
-        IntPtr appHwnd = TaskbarButtonAppWindowAt(x, y);
-        if (appHwnd != IntPtr.Zero)
-        {
-            uint pid;
-            GetWindowThreadProcessId(appHwnd, out pid);
-            if (pid != 0 && IsTargetPid(pid)) return "taskbar click (pid match)";
-        }
-
-        // Win7/8-style toolbar: the click was resolved to a different app's button
-        // (appHwnd != Zero but pid didn't match) - correctly not a switch-back.
-        // On modern Win10 taskbars appHwnd is always Zero and the appid path below
-        // handles the same strictness via the button's executable path.
-        if (appHwnd != IntPtr.Zero)
-        {
-            if (IsAnySuspended())
-                Log("[WARN] Taskbar click at (" + x + "," + y + ") ignored: that button belongs to another app.");
-            return null;
-        }
-
-        // (3) definitive match: on modern Win10 taskbars each button exposes the
-        //     app's executable path in its UIA AutomationId ("Appid: <exe path>").
-        //     The clicked button's path is compared against the target process's
-        //     exe path - a click on any OTHER app's button is refused, exactly like
-        //     the old strict title path but without relying on window titles.
-        TrayButtonInfo hit = ButtonUnder(x, y);
-        if (hit != null && hit.AppPath.Length > 0)
-        {
-            string p = StripAppidPrefix(hit.AppPath);
-            bool verifiable = RefreshTargetExePaths();
-            if (verifiable && MatchesTargetPath(p)) return "taskbar click (appid match)";
-            if (verifiable)
-            {
-                if (IsAnySuspended())
-                    Log("[WARN] Taskbar click at (" + x + "," + y + ") ignored: that button belongs to another app (\"" + hit.Name + "\").");
-                return null;
-            }
-            // target exe path unreadable: fall through to the region fallback
-        }
-
-        // (4) last resort: the click is over a button that could not be mapped to
-        //     any app (no AutomationId), a secondary-monitor taskbar (buttons not
-        //     enumerated), or enumeration is broken entirely - in those cases a
-        //     click while something is suspended counts as a switch-back attempt.
-        //     Clicks on empty taskbar gaps/edges are never switch-backs.
-        if (IsAnySuspended())
-        {
-            bool noButtons;
-            lock (taskbarButtons) noButtons = taskbarButtons.Count == 0;
-            if (hit != null || ClickInSecondaryTaskbar(x, y) || noButtons)
-            {
-                if (title.Length == 0)
-                    Log("[WARN] Target has no readable window title - taskbar click treated as switch-back attempt.");
-                return "taskbar click (button region)";
-            }
-            Log("[WARN] Taskbar click at (" + x + "," + y + ") ignored: not on any taskbar button (gap or edge).");
-        }
-        return null;
-    }
-
-    private static TrayButtonInfo ButtonUnder(int x, int y)
-    {
-        lock (taskbarButtons)
-        {
-            foreach (TrayButtonInfo b in taskbarButtons)
-                if (b.Contains(x, y)) return b;
-        }
-        return null;
     }
 
     /// <summary>Strips Win10 taskbar button name suffixes: " - 3 running windows", " pinned".</summary>
@@ -1608,183 +1561,11 @@ public static class ProcessSuspenderApp
         return s.Trim();
     }
 
-    private static readonly List<string> targetExePaths = new List<string>();
-    private static DateTime targetExePathsAt = DateTime.MinValue;
-
-    /// <summary>
-    /// Caches the target process's exe path(s) for 5s. Returns false when the target
-    /// path cannot be resolved (target gone, access denied) - callers must then treat
-    /// appid matching as unverifiable and fall back instead of refusing the click.
-    /// </summary>
-    private static bool RefreshTargetExePaths()
-    {
-        if ((DateTime.UtcNow - targetExePathsAt).TotalSeconds < 5) return targetExePaths.Count > 0;
-        targetExePathsAt = DateTime.UtcNow;
-        targetExePaths.Clear();
-        try
-        {
-            uint pid = 0;
-            string nameCopy = null;
-            lock (StateLock)
-            {
-                if (WindowTargets.Count > 0)
-                    pid = WindowTargets[0].Pid;
-                else if (targetName != null)
-                    nameCopy = targetName;
-            }
-            if (nameCopy != null && pid == 0)
-            {
-                Process[] list = Process.GetProcessesByName(nameCopy);
-                foreach (Process p in list)
-                {
-                    try { AddExePath(p); }
-                    finally { try { p.Dispose(); } catch { } }
-                    if (targetExePaths.Count > 0) return true;
-                }
-                return targetExePaths.Count > 0;
-            }
-            if (pid != 0)
-            {
-                using (Process p = Process.GetProcessById((int)pid))
-                    AddExePath(p);
-            }
-            else if (nameCopy != null)
-            {
-                Process[] list2 = Process.GetProcessesByName(nameCopy);
-                foreach (Process p in list2)
-                {
-                    try { AddExePath(p); }
-                    finally { try { p.Dispose(); } catch { } }
-                }
-            }
-        }
-        catch { }
-        return targetExePaths.Count > 0;
-    }
-
-    private static void AddExePath(Process p)
-    {
-        try
-        {
-            string f = p.MainModule.FileName;
-            if (!string.IsNullOrEmpty(f))
-                targetExePaths.Add(f.Replace('\\', '/').ToLowerInvariant());
-        }
-        catch { }
-    }
-
-    /// <summary>True when appPath (an exe path from a taskbar button's AutomationId) belongs to the target process.</summary>
-    private static bool MatchesTargetPath(string appPath)
-    {
-        if (targetExePaths.Count == 0) return false;
-        string p = appPath.Replace('\\', '/').ToLowerInvariant();
-        foreach (string t in targetExePaths)
-        {
-            if (p == t) return true;
-            int slash = t.LastIndexOf('/');
-            if (slash >= 0 && p.EndsWith(t.Substring(slash), StringComparison.Ordinal)) return true;
-        }
-        return false;
-    }
-
-    /// <summary>True when (x, y) lies over any secondary-monitor taskbar window.</summary>
-    private static bool ClickInSecondaryTaskbar(int x, int y)
-    {
-        foreach (IntPtr bar in EnumTaskbars())
-        {
-            var sb = new StringBuilder(128);
-            GetClassName(bar, sb, sb.Capacity);
-            string cls = sb.ToString();
-            if (cls == "Shell_SecondaryTrayWnd")
-            {
-                RECT r;
-                if (GetWindowRect(bar, out r) && x >= r.Left && x <= r.Right && y >= r.Top && y <= r.Bottom)
-                    return true;
-            }
-        }
-        return false;
-    }
-
-    private static bool IsAnySuspended()
-    {
-        lock (StateLock) return Suspended.Count > 0;
-    }
-
-    /// <summary>True when the pid belongs to the current target (window mode or process-name mode).</summary>
-    private static bool IsTargetPid(uint pid)
-    {
-        string nameCopy = null;
-        lock (StateLock)
-        {
-            foreach (WindowTarget t in WindowTargets)
-                if (t.Pid == pid) return true;
-            if (targetName != null) nameCopy = targetName;
-        }
-        if (nameCopy != null)
-        {
-            try
-            {
-                Process[] list = Process.GetProcessesByName(nameCopy);
-                foreach (Process p in list)
-                {
-                    try { if ((uint)p.Id == pid) return true; }
-                    finally { try { p.Dispose(); } catch { } }
-                }
-            }
-            catch { }
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Win10 taskbar toolbar buttons (ToolbarWindow32 inside MSTaskSwWClass) store the
-    /// window handle of the app they represent in TBBUTTON.dwData. Returns that handle
-    /// for the button under (x, y), or IntPtr.Zero when the click is not on a button or
-    /// the toolbar cannot be read (Win11 XAML taskbar, tweaks, etc.).
-    /// </summary>
-    private static IntPtr TaskbarButtonAppWindowAt(int x, int y)
-    {
-        foreach (IntPtr bar in EnumTaskbars())
-        {
-            IntPtr toolbar = FindTrayToolbar(bar);
-            if (toolbar == IntPtr.Zero) continue;
-            int count = (int)SendMessage(toolbar, TB_BUTTONCOUNT, IntPtr.Zero, IntPtr.Zero);
-            for (int i = 0; i < count; i++)
-            {
-                RECT r = new RECT();
-                if (SendMessage(toolbar, TB_GETITEMRECT, (IntPtr)i, ref r) == IntPtr.Zero) continue;
-                POINT p1 = new POINT { X = r.Left, Y = r.Top };
-                POINT p2 = new POINT { X = r.Right, Y = r.Bottom };
-                ClientToScreen(toolbar, ref p1);
-                ClientToScreen(toolbar, ref p2);
-                r.Left = p1.X; r.Top = p1.Y; r.Right = p2.X; r.Bottom = p2.Y;
-                if (x >= r.Left && x <= r.Right && y >= r.Top && y <= r.Bottom)
-                {
-                    TBBUTTON b = new TBBUTTON();
-                    if (SendMessage(toolbar, TB_GETBUTTON, (IntPtr)i, ref b) != IntPtr.Zero)
-                        return b.dwData;
-                    return IntPtr.Zero;
-                }
-            }
-        }
-        return IntPtr.Zero;
-    }
-
-    /// <summary>Win10 taskbar structure: Shell_TrayWnd -> ReBarWindow32 -> MSTaskSwWClass -> ToolbarWindow32.</summary>
-    private static IntPtr FindTrayToolbar(IntPtr tray)
-    {
-        IntPtr rebar = FindWindowEx(tray, IntPtr.Zero, "ReBarWindow32", null);
-        IntPtr sw = rebar == IntPtr.Zero ? FindWindowEx(tray, IntPtr.Zero, "MSTaskSwWClass", null)
-                                         : FindWindowEx(rebar, IntPtr.Zero, "MSTaskSwWClass", null);
-        if (sw == IntPtr.Zero) return IntPtr.Zero;
-        return FindWindowEx(sw, IntPtr.Zero, "ToolbarWindow32", null);
-    }
-
     private static DateTime taskbarDetectAt = DateTime.MinValue;
 
     private static void RefreshTaskbarButtons()
     {
-        if ((DateTime.UtcNow - taskbarButtonsCached).TotalMilliseconds < 400) return;
+        if ((DateTime.UtcNow - taskbarButtonsCached).TotalMilliseconds < 1000) return;
         taskbarButtonsCached = DateTime.UtcNow;
         // Enumerate buttons on every taskbar (primary + secondary monitors): a
         // click on another app's button on a secondary taskbar must be ignored too.
@@ -1808,7 +1589,12 @@ public static class ProcessSuspenderApp
             LogTrayCache();
             return;
         }
-        lock (taskbarButtons) taskbarButtons.Clear();
+        List<TrayButtonInfo> prevButtons;
+        lock (taskbarButtons)
+        {
+            prevButtons = new List<TrayButtonInfo>(taskbarButtons);
+            taskbarButtons.Clear();
+        }
         bool failed = false;
         // Re-probe while undecided (Unknown) or downgraded (Legacy): a single
         // failed probe (taskbar busy, Explorer restarting) must not stick
@@ -1847,6 +1633,36 @@ public static class ProcessSuspenderApp
         {
             failed = true; // Legacy: no buttons, hook keeps old resume-first behaviour
         }
+        if (failed)
+        {
+            // A failed enumeration must not wipe the last-good cache: with zero
+            // buttons every taskbar click (Start included) would resume-first
+            // until the next successful tick.
+            lock (taskbarButtons)
+            {
+                if (taskbarButtons.Count == 0 && prevButtons.Count > 0)
+                    taskbarButtons.AddRange(prevButtons);
+            }
+        }
+        else
+        {
+            // A "successful" walk that found zero buttons while we previously
+            // had some is bogus too (Start-menu animation tears down the XAML
+            // tree for a tick). Keep last-good and report stale instead of
+            // emptying the cache. A genuinely empty taskbar (prev also empty)
+            // still clears normally.
+            bool emptied = false;
+            lock (taskbarButtons) emptied = taskbarButtons.Count == 0;
+            if (emptied && prevButtons.Count > 0)
+            {
+                lock (taskbarButtons)
+                {
+                    if (taskbarButtons.Count == 0)
+                        taskbarButtons.AddRange(prevButtons);
+                }
+                failed = true;
+            }
+        }
         taskbarButtonsStale = failed;
         LogTrayCache();
     }
@@ -1856,11 +1672,13 @@ public static class ProcessSuspenderApp
     {
         try
         {
-            int buttons, exes, titles;
+            int buttons, exes, titles, sysAreas;
             lock (taskbarButtons) buttons = taskbarButtons.Count;
             lock (HookCacheLock) { exes = hookTargetExePaths.Count; titles = hookTargetTitles.Count; }
+            lock (TaskbarLock) sysAreas = hookSystemRects.Count;
             string s = "trayMode=" + trayMode + " buttons=" + buttons + " stale=" + taskbarButtonsStale
-                + " targetExe=" + exes + " targetTitles=" + titles;
+                + " targetExe=" + exes + " targetTitles=" + titles + " sysAreas=" + sysAreas
+                + " targetBtn=" + hookTargetButtonPresent;
             if (s != lastTrayCacheLog)
             {
                 lastTrayCacheLog = s;
@@ -1914,23 +1732,34 @@ public static class ProcessSuspenderApp
     /// <summary>Fills taskbarButtons from one taskbar via UIA. Returns false when the walk failed.</summary>
     private static bool FillFromUia(IntPtr tray)
     {
+        List<TrayButtonInfo> fresh = new List<TrayButtonInfo>();
         try
         {
             AutomationElement root = AutomationElement.FromHandle(tray);
             if (root == null) return false;
             var walker = TreeWalker.ControlViewWalker;
+            // Walk WITHOUT holding taskbarButtons: the UIA walk can take
+            // 50-200ms and the mouse hook needs that lock per click. Holding
+            // it here stalls all mouse input (jumpy cursor).
+            FillUiaWalk(root, walker, fresh);
             lock (taskbarButtons)
             {
-                FillUiaWalk(root, walker);
+                taskbarButtons.AddRange(fresh);
             }
             return true;
         }
-        catch { lock (taskbarButtons) taskbarButtons.Clear(); return false; }
+        catch { return false; }
     }
 
-    private static void FillUiaWalk(AutomationElement parent, TreeWalker walker)
+    private static void FillUiaWalk(AutomationElement parent, TreeWalker walker, List<TrayButtonInfo> output)
     {
-        var el = walker.GetFirstChild(parent);
+        // Every UIA call can throw COM exceptions, especially while the shell
+        // is animating (Start menu opening/closing). An unguarded throw here
+        // used to fail the whole enumeration, marking the cache stale exactly
+        // when the user clicks Start - and the stale fallback then woke the game.
+        AutomationElement el;
+        try { el = walker.GetFirstChild(parent); }
+        catch { return; }
         while (el != null)
         {
             try
@@ -1941,7 +1770,7 @@ public static class ProcessSuspenderApp
                     System.Windows.Rect r = el.Current.BoundingRectangle;
                     if (r.Width > 0 && r.Height > 0)
                     {
-                        taskbarButtons.Add(new TrayButtonInfo
+                        output.Add(new TrayButtonInfo
                         {
                             Left = (int)r.Left, Top = (int)r.Top,
                             Right = (int)(r.Left + r.Width), Bottom = (int)(r.Top + r.Height),
@@ -1952,16 +1781,18 @@ public static class ProcessSuspenderApp
                 }
                 else
                 {
-                    FillUiaWalk(el, walker);
+                    FillUiaWalk(el, walker, output);
                 }
             }
             catch { }
-            el = walker.GetNextSibling(el);
+            try { el = walker.GetNextSibling(el); }
+            catch { break; }
         }
     }
 
     private static bool FillFromWin32(IntPtr tray)
     {
+        var fresh = new List<TrayButtonInfo>();
         try
         {
             foreach (IntPtr c in DescendantWindows(tray))
@@ -1973,13 +1804,14 @@ public static class ProcessSuspenderApp
                 if (!GetWindowRect(c, out r)) continue;
                 var tb = new StringBuilder(256);
                 GetWindowText(c, tb, tb.Capacity);
-                lock (taskbarButtons)
-                    taskbarButtons.Add(new TrayButtonInfo
-                    {
-                        Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Bottom,
-                        Name = tb.ToString()
-                    });
+                fresh.Add(new TrayButtonInfo
+                {
+                    Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Bottom,
+                    Name = tb.ToString()
+                });
             }
+            lock (taskbarButtons)
+                taskbarButtons.AddRange(fresh);
             return true;
         }
         catch { return false; }
@@ -2017,40 +1849,6 @@ public static class ProcessSuspenderApp
         return found;
     }
 
-    private static string GetTargetTitle()
-    {
-        IntPtr hwnd = IntPtr.Zero;
-        string name = null;
-        lock (StateLock)
-        {
-            if (targetName != null) name = targetName;
-            else if (WindowTargets.Count > 0) hwnd = WindowTargets[0].Hwnd;
-        }
-        try
-        {
-            if (name != null)
-            {
-                Process[] list = Process.GetProcessesByName(name);
-                foreach (Process p in list)
-                {
-                    try
-                    {
-                        if (p.MainWindowHandle != IntPtr.Zero)
-                        {
-                            string t = GetWindowTitle(p.MainWindowHandle);
-                            if (t.Length > 0) return t;
-                        }
-                    }
-                    finally { try { p.Dispose(); } catch { } }
-                }
-                return "";
-            }
-            if (hwnd != IntPtr.Zero) return GetWindowTitle(hwnd);
-        }
-        catch { }
-        return "";
-    }
-
     private static readonly string[] TaskbarClassNames = { "Shell_TrayWnd", "Shell_SecondaryTrayWnd" };
 
     /// <summary>All taskbars on all monitors (primary is Shell_TrayWnd, additional are Shell_SecondaryTrayWnd).</summary>
@@ -2066,7 +1864,7 @@ public static class ProcessSuspenderApp
     {
         lock (TaskbarLock)
         {
-            if ((DateTime.UtcNow - taskbarWindowsAt).TotalMilliseconds < 500)
+            if ((DateTime.UtcNow - taskbarWindowsAt).TotalMilliseconds < 2000)
                 return new List<IntPtr>(taskbarWindows);
         }
         var fresh = new List<IntPtr>();
@@ -2094,15 +1892,90 @@ public static class ProcessSuspenderApp
         }
     }
 
-    private static bool IsInTaskbar(int x, int y)
+    /// <summary>
+    /// Hook-thread hit test: reads only the worker-cached rects, never calls
+    /// EnumWindows (that scan on every click is what made the cursor jumpy).
+    /// Empty cache = conservative true so a click never leaves the game stuck.
+    /// </summary>
+    private static bool IsInTaskbarCached(int x, int y)
     {
-        foreach (IntPtr h in EnumTaskbars())
+        lock (TaskbarLock)
+        {
+            if (hookTaskbarRects.Count == 0) return true;
+            foreach (RECT r in hookTaskbarRects)
+            {
+                if (x >= r.Left - 8 && x <= r.Right + 8
+                    && y >= r.Top - 8 && y <= r.Bottom + 8)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Worker-only: refreshes the hook's taskbar rect cache (no hook may call this).</summary>
+    private static void RefreshHookTaskbarRects()
+    {
+        List<IntPtr> bars;
+        try { bars = EnumTaskbars(); }
+        catch { return; }
+        var rects = new List<RECT>(bars.Count);
+        var sysRects = new List<RECT>(bars.Count * 2);
+        foreach (IntPtr h in bars)
         {
             RECT r;
-            if (GetWindowRect(h, out r)
-                && x >= r.Left - 8 && x <= r.Right + 8
-                && y >= r.Top - 8 && y <= r.Bottom + 8)
-                return true;
+            try
+            {
+                if (GetWindowRect(h, out r)) rects.Add(r);
+            }
+            catch { }
+            // System areas that are never app buttons (Win32 children, present on
+            // Win10 and Win11 alike). The Win11 Start button itself is XAML with
+            // no HWND, so it is covered by the button-cache path instead.
+            try { AddChildRect(h, "Start", sysRects); } catch { }
+            try { AddChildRect(h, "TrayNotifyWnd", sysRects); } catch { }
+        }
+        lock (TaskbarLock)
+        {
+            // Never zero the caches on a transient miss (Explorer restarting,
+            // Start-menu animation): empty rects make every click look like it
+            // is inside the taskbar with no known buttons around.
+            if (rects.Count > 0)
+            {
+                hookTaskbarRects.Clear();
+                hookTaskbarRects.AddRange(rects);
+            }
+            if (sysRects.Count > 0)
+            {
+                hookSystemRects.Clear();
+                hookSystemRects.AddRange(sysRects);
+            }
+        }
+    }
+
+    private static void AddChildRect(IntPtr parent, string cls, List<RECT> output)
+    {
+        IntPtr child = FindWindowEx(parent, IntPtr.Zero, cls, null);
+        if (child == IntPtr.Zero) return;
+        RECT r;
+        if (GetWindowRect(child, out r)
+            && r.Right > r.Left && r.Bottom > r.Top)
+            output.Add(r);
+    }
+
+    /// <summary>
+    /// Hook-thread hit test against the worker-cached system areas (Start button,
+    /// tray/clock). Tight rects, no margin: these sit adjacent to real app buttons
+    /// and must never swallow a click on the game's own button.
+    /// </summary>
+    private static bool IsInSystemAreaCached(int x, int y)
+    {
+        lock (TaskbarLock)
+        {
+            foreach (RECT r in hookSystemRects)
+            {
+                if (x >= r.Left && x <= r.Right && y >= r.Top && y <= r.Bottom)
+                    return true;
+            }
         }
         return false;
     }
@@ -2250,6 +2123,12 @@ public static class ProcessSuspenderApp
             return;
         }
 
+        // Fallback for hook-requested resumes (ThreadPool already handles the
+        // fast path; this covers the case where it was delayed/starved).
+        if (pendingResume)
+        {
+            try { DrainPendingResume(); } catch { }
+        }
         if (pendingForegroundSuspend)
         {
             pendingForegroundSuspend = false;
@@ -2398,6 +2277,13 @@ public static class ProcessSuspenderApp
     /// <summary>Drops handles for exited child processes the tree walk no longer sees.</summary>
     private static void GcChildHandles()
     {
+        // Cheap checks first: the full process snapshot below is the most
+        // expensive call in the idle loop. Skip it when there is nothing to clean.
+        lock (StateLock)
+        {
+            if (targetName != null) return; // name-mode handles are all top-level, refreshed separately
+            if (WindowTargets.Count == 0 || Handles.Count == 0) return;
+        }
         List<ProcInfo> snap = null;
         try { snap = SnapshotProcesses(); } catch { return; }
         if (snap == null) return;
@@ -2485,6 +2371,10 @@ public static class ProcessSuspenderApp
     {
         bool holding = ComputeHolding();
         uint fgPid = ResolveForegroundPid();
+        if (fgPid == 0) holding = true; // transient no-foreground reading
+        // (Alt+Tab animation, UAC prompt, lock screen): change nothing this
+        // tick instead of throttling on a phantom defocus and restoring a
+        // tick later.
 
         bool ignoreMinimize = Config != null && !Config.SuspendWhenMinimized;
 
@@ -2519,7 +2409,12 @@ public static class ProcessSuspenderApp
                 else if (focused && t.ChildrenLive)
                 {
                     DropChildrenOf(pid);
-                    t.ChildrenLive = false;
+                    // Only stop watching once no frozen descendants remain: a
+                    // failed/incomplete drop (missed snapshot, new child) must
+                    // be retried on the next focused tick, otherwise a helper
+                    // process stays capped and the game never feels restored.
+                    if (!AnyFrozenDescendantLocked(pid))
+                        t.ChildrenLive = false;
                 }
             }
         }
@@ -2625,6 +2520,7 @@ public static class ProcessSuspenderApp
     {
         bool holding = ComputeHolding();
         uint fgPid = ResolveForegroundPid();
+        if (fgPid == 0) holding = true; // same transient guard as window mode
 
         bool ignoreMinimize = Config != null && !Config.SuspendWhenMinimized;
 
@@ -2693,13 +2589,16 @@ public static class ProcessSuspenderApp
         {
             if (FocusedNow.Add(pid))
                 Log("[FOCUS] " + DescribeProcess(pid) + " (pid " + pid + ") focused (fg pid " + fgPid + ")");
+            unfocusedSince.Remove(pid);
         }
         else
         {
             FocusedNow.Remove(pid);
+            if (!unfocusedSince.ContainsKey(pid))
+                unfocusedSince[pid] = DateTime.UtcNow;
         }
 
-        if (!focused && !isFrozen && !hold)
+        if (!focused && !isFrozen && !hold && DefocusSettled(pid) && PastRecovery(pid))
         {
             if (IsNeverSuspendPid((uint)pid))
             {
@@ -2736,12 +2635,14 @@ public static class ProcessSuspenderApp
         }
         else if (focused && isFrozen)
         {
+            unfocusedSince.Remove(pid);
             if (isSuspended)
             {
                 if (ResumeFully(h))
                 {
                     Suspended.Remove(pid);
                     WarnedResumePids.Remove(pid);
+                    lastRestoreAt[pid] = DateTime.UtcNow;
                     Log("[RESUME]  " + DescribeProcess(pid) + " (pid " + pid + ")");
                 }
                 else
@@ -2754,9 +2655,26 @@ public static class ProcessSuspenderApp
             if (isThrottled)
             {
                 RestoreEcoLocked(pid, h);
+                lastRestoreAt[pid] = DateTime.UtcNow;
                 Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ")");
             }
         }
+    }
+
+    /// <summary>True once the defocus has lasted ThrottleDelayMs (stable, not a switch flicker).</summary>
+    private static bool DefocusSettled(int pid)
+    {
+        DateTime since;
+        if (!unfocusedSince.TryGetValue(pid, out since)) return true; // no record: old path behaves as settled
+        return (DateTime.UtcNow - since).TotalMilliseconds >= ThrottleDelayMs;
+    }
+
+    /// <summary>True once RestoreRecoveryMs passed since the last restore (recovery window).</summary>
+    private static bool PastRecovery(int pid)
+    {
+        DateTime at;
+        if (!lastRestoreAt.TryGetValue(pid, out at)) return true;
+        return (DateTime.UtcNow - at).TotalMilliseconds >= RestoreRecoveryMs;
     }
 
     /// <summary>
@@ -2783,6 +2701,15 @@ public static class ProcessSuspenderApp
     private static void ApplyEcoLocked(int pid, IntPtr h)
     {
         if (Throttled.Contains(pid)) return;
+        if (MinimalHandles.Contains(pid))
+        {
+            // Honesty: a minimal handle cannot set priority, EcoQoS or job
+            // caps, so Eco here would be a silent no-op.
+            if (WarnedMinimalEco.Add(pid))
+                Log("[WARN] " + DescribeProcess(pid) + " (pid " + pid
+                    + ") Eco-throttle skipped: process is hardened (full access denied).");
+            return;
+        }
         if (!OrigPriority.ContainsKey(pid))
         {
             uint orig = NORMAL_PRIORITY_CLASS;
@@ -2801,6 +2728,9 @@ public static class ProcessSuspenderApp
         Throttled.Add(pid);
         double cap = Config != null ? Config.EcoCpuCapPercentClamped : 2.0;
         Log("[THROTTLE] " + DescribeProcess(pid) + " (pid " + pid + ") - Eco low-power (IDLE + EcoQoS + " + cap + "% cap)");
+        if (cap < 5.0 && WarnedLowCap.Add(pid))
+            Log("[WARN] Eco CPU cap is " + cap + "% - extremely low caps can permanently wedge fragile games "
+                + "(they never recover even after restore). Consider 5%+ or Suspend mode.");
         AudioMuter.SetPidMuted(pid, true);
     }
 
@@ -2819,10 +2749,76 @@ public static class ProcessSuspenderApp
         // handle is kept for the next throttle cycle instead of closed.
         IntPtr job;
         if (EcoJobs.TryGetValue(pid, out job))
+        {
             TrySetJobCap(job, CPU_RATE_UNLIMITED);
+            // Verify the cap actually lifted. The state below is cleared and
+            // the restore is logged as done, so a silent failure here used to
+            // leave the game throttled forever while looking restored
+            // (1 frame per few seconds at a 0.1% cap).
+            uint rate;
+            bool lifted = TryGetJobCap(job, out rate);
+            if (!lifted || rate < CPU_RATE_UNLIMITED)
+            {
+                TrySetJobCap(job, CPU_RATE_UNLIMITED); // one immediate retry
+                lifted = TryGetJobCap(job, out rate) && rate >= CPU_RATE_UNLIMITED;
+            }
+            if (!lifted)
+            {
+                // Stay in Throttled so the focused tick retries the restore
+                // instead of declaring victory; warn once per stuck episode.
+                if (WarnedEcoRestorePids.Add(pid))
+                    Log("[WARN] " + DescribeProcess(pid) + " (pid " + pid
+                        + ") still capped after restore - retrying while focused.");
+                try { AudioMuter.SetPidMuted(pid, false); } catch { }
+                return;
+            }
+        }
+        // Verify the priority came back too: a silent failure here leaves the
+        // game at IDLE while the state says restored.
+        try
+        {
+            uint curPri = GetPriorityClass(h);
+            if (curPri != 0 && curPri != orig)
+            {
+                try { SetPriorityClass(h, orig); } catch { }
+                try { curPri = GetPriorityClass(h); } catch { }
+            }
+            if (curPri != 0 && curPri != orig)
+            {
+                if (WarnedEcoRestorePids.Add(pid))
+                    Log("[WARN] " + DescribeProcess(pid) + " (pid " + pid
+                        + ") priority still " + curPri + " after restore - retrying while focused.");
+                try { AudioMuter.SetPidMuted(pid, false); } catch { }
+                return;
+            }
+        }
+        catch { }
+        WarnedEcoRestorePids.Remove(pid);
         OrigPriority.Remove(pid);
         Throttled.Remove(pid);
         AudioMuter.SetPidMuted(pid, false);
+    }
+
+    /// <summary>Reads back the effective CPU rate of an Eco job (10000 = uncapped).</summary>
+    private static bool TryGetJobCap(IntPtr job, out uint rate)
+    {
+        rate = 0;
+        try
+        {
+            JOB_CPU_RATE_CONTROL info = new JOB_CPU_RATE_CONTROL();
+            uint ret;
+            if (!QueryInformationJobObject(job, JobObjectCpuRateControlInformation,
+                ref info, (uint)Marshal.SizeOf(typeof(JOB_CPU_RATE_CONTROL)), out ret))
+                return false;
+            if ((info.ControlFlags & CPU_RATE_ENABLE) == 0)
+            {
+                rate = CPU_RATE_UNLIMITED;
+                return true;
+            }
+            rate = info.CpuRate;
+            return true;
+        }
+        catch { return false; }
     }
 
     private static void SetEcoQoS(IntPtr h, bool enable)
@@ -2921,22 +2917,23 @@ public static class ProcessSuspenderApp
     /// <summary>Re-applies the configured CPU cap to live Eco jobs (after a settings change).</summary>
     private static void ApplyEcoCaps()
     {
-        var copy = new List<KeyValuePair<int, IntPtr>>();
-        var limited = new HashSet<int>();
-        double cap = 2.0;
+        // Writes happen under the same lock as the throttle/restore paths: a
+        // snapshot-then-write-outside-the-lock race could otherwise uncap a
+        // job that was throttled in between, leaving it unlimited while the
+        // state says throttled. The write is a fast syscall; no deadlock risk.
         lock (StateLock)
         {
+            double cap = 2.0;
             if (Config != null) cap = Config.EcoCpuCapPercentClamped;
-            foreach (KeyValuePair<int, IntPtr> kv in EcoJobs)
-                copy.Add(kv);
+            uint limitedRate = CapToRate(cap);
+            var limited = new HashSet<int>();
             foreach (int pid in Throttled)
                 limited.Add(pid);
-        }
-        uint limitedRate = CapToRate(cap);
-        foreach (KeyValuePair<int, IntPtr> kv in copy)
-        {
-            // Restored jobs are retained for reuse: keep them explicitly uncapped.
-            TrySetJobCap(kv.Value, limited.Contains(kv.Key) ? limitedRate : CPU_RATE_UNLIMITED);
+            foreach (KeyValuePair<int, IntPtr> kv in EcoJobs)
+            {
+                // Restored jobs are retained for reuse: keep them explicitly uncapped.
+                TrySetJobCap(kv.Value, limited.Contains(kv.Key) ? limitedRate : CPU_RATE_UNLIMITED);
+            }
         }
     }
 
@@ -3159,11 +3156,16 @@ public static class ProcessSuspenderApp
         }
         catch { }
         IntPtr h = OpenProcess(PROCESS_ALL, false, (uint)pid);
-        if (h == IntPtr.Zero)
+        if (h != IntPtr.Zero)
+        {
+            MinimalHandles.Remove(pid);
+        }
+        else
         {
             // Expanded rights can fail on hardened processes where the old minimal
             // mask still works (suspend-only). Fall back before giving up.
             h = OpenProcess(PROCESS_MINIMAL, false, (uint)pid);
+            if (h != IntPtr.Zero) MinimalHandles.Add(pid);
         }
         if (h == IntPtr.Zero)
         {
@@ -3217,6 +3219,11 @@ public static class ProcessSuspenderApp
         Suspended.Remove(pid);
         Throttled.Remove(pid);
         OrigPriority.Remove(pid);
+        MinimalHandles.Remove(pid);
+        WarnedMinimalEco.Remove(pid);
+        WarnedLowCap.Remove(pid);
+        unfocusedSince.Remove(pid);
+        lastRestoreAt.Remove(pid);
         IntPtr job;
         if (EcoJobs.TryGetValue(pid, out job))
         {
@@ -3233,18 +3240,47 @@ public static class ProcessSuspenderApp
         if (snap == null) return;
         lock (StateLock)
         {
-            DropDescendants(parentPid, snap, new HashSet<int>());
+            int restored = 0;
+            DropDescendants(parentPid, snap, new HashSet<int>(), ref restored);
+            if (restored > 0)
+                Log("[ECO-RESTORE] " + restored + " child process(es) of "
+                    + DescribeProcess(parentPid) + " (pid " + parentPid + ") restored on focus.");
         }
     }
 
-    private static void DropDescendants(int pid, List<ProcInfo> snap, HashSet<int> seen)
+    /// <summary>True when any live descendant of parentPid is still suspended/throttled.
+    /// Caller must hold StateLock. Unknown (no snapshot) counts as true so the
+    /// caller retries instead of assuming the drop worked.</summary>
+    private static bool AnyFrozenDescendantLocked(int parentPid)
+    {
+        var snap = SnapshotProcesses();
+        if (snap == null) return true;
+        var seen = new HashSet<int>();
+        seen.Add(parentPid);
+        var stack = new Stack<int>(ChildPids(snap, parentPid));
+        while (stack.Count > 0)
+        {
+            int c = stack.Pop();
+            if (!seen.Add(c)) continue;
+            if (Throttled.Contains(c) || Suspended.Contains(c)) return true;
+            foreach (int g in ChildPids(snap, c)) stack.Push(g);
+        }
+        return false;
+    }
+
+    private static void DropDescendants(int pid, List<ProcInfo> snap, HashSet<int> seen, ref int restored)
     {
         seen.Add(pid);
         foreach (int cid in ChildPids(snap, pid))
         {
             if (!seen.Add(cid)) continue;
-            if (Handles.ContainsKey(cid)) DropHandleLocked(cid);
-            DropDescendants(cid, snap, seen);
+            if (Handles.ContainsKey(cid))
+            {
+                bool wasFrozen = Suspended.Contains(cid) || Throttled.Contains(cid);
+                DropHandleLocked(cid);
+                if (wasFrozen) restored++;
+            }
+            DropDescendants(cid, snap, seen, ref restored);
         }
     }
 
@@ -3273,19 +3309,53 @@ public static class ProcessSuspenderApp
         Suspended.Clear();
         Throttled.Clear();
         WarnedResumePids.Clear();
+        WarnedEcoRestorePids.Clear();
+        WarnedMinimalEco.Clear();
+        WarnedLowCap.Clear();
+        MinimalHandles.Clear();
+        unfocusedSince.Clear();
+        lastRestoreAt.Clear();
     }
+
+    private static readonly Dictionary<int, string> describeCache = new Dictionary<int, string>();
+    private static readonly Dictionary<int, DateTime> describeCacheAt = new Dictionary<int, DateTime>();
+    private static readonly object DescribeLock = new object();
 
     private static string DescribeProcess(int pid)
     {
+        // Cache process names for 30s: this is called on suspend/resume/log paths
+        // (sometimes while holding StateLock), and each lookup costs a Process
+        // object + OpenProcess round-trip. Names are stable per pid lifetime.
+        lock (DescribeLock)
+        {
+            string cached;
+            DateTime at;
+            if (describeCache.TryGetValue(pid, out cached)
+                && describeCacheAt.TryGetValue(pid, out at)
+                && (DateTime.UtcNow - at).TotalSeconds < 30)
+                return cached;
+        }
+        string name;
         try
         {
             using (Process p = Process.GetProcessById(pid))
-                return p.ProcessName;
+                name = p.ProcessName;
         }
         catch
         {
-            return "(unknown)";
+            name = "(unknown)";
         }
+        lock (DescribeLock)
+        {
+            if (describeCache.Count > 512)
+            {
+                describeCache.Clear();
+                describeCacheAt.Clear();
+            }
+            describeCache[pid] = name;
+            describeCacheAt[pid] = DateTime.UtcNow;
+        }
+        return name;
     }
 
     /// <summary>True when the process is on the never-suspend whitelist (by name, e.g. "explorer").</summary>
