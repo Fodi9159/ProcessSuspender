@@ -21,7 +21,13 @@ public static class ProcessSuspenderApp
     private const uint PROCESS_ALL = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_ECO_ACCESS;
     private const uint PROCESS_MINIMAL = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION;
     private const int LogCapacity = 500;
-    private const int SwitchGestureTimeoutMs = 5000;
+    // Max time a switch gesture keeps the target running. Must cover a user
+    // holding the Alt+Tab switcher open with no further keys (silent Alt hold
+    // produces no hook events, so no keepalive can refresh it). Fail-open is
+    // safe here: a stuck gesture only keeps the game running longer, while too
+    // short a timeout re-freezes the game before Alt is released and the
+    // release-time activation fails.
+    private const int SwitchGestureTimeoutMs = 30000;
     private const int PostSwitchGraceMs = 500;
 
     [DllImport("ntdll.dll")]
@@ -104,6 +110,9 @@ public static class ProcessSuspenderApp
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+    private const int VK_LBUTTON = 0x01;
+    [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")]
     private static extern bool IsWindow(IntPtr hwnd);
@@ -171,6 +180,11 @@ public static class ProcessSuspenderApp
     private static readonly HashSet<int> WarnedLowCap = new HashSet<int>();
     private static readonly HashSet<int> FocusedNow = new HashSet<int>();
     private static uint lastFgPid;
+    // Last foreground change: while the user is actively switching (recent
+    // change), button caches refresh every 1s; when the foreground has been
+    // stable for a while they back off to every 4s. Clicks only need fresh
+    // buttons around activity.
+    private static DateTime lastFgChangeAt = DateTime.MinValue;
     private static DateTime lastNameRefresh = DateTime.MinValue;
     private static DateTime lastWindowRefresh = DateTime.MinValue;
     private static DateTime lastChildScan = DateTime.MinValue;
@@ -257,6 +271,15 @@ public static class ProcessSuspenderApp
     /// cache is otherwise stale, instead of resuming first.
     /// </summary>
     private static volatile bool hookTargetButtonPresent;
+    /// <summary>
+    /// True when a button enumeration succeeded within the last 5s (worker
+    /// refreshes, hook only reads). A freshly verified cache is complete by
+    /// definition, so clicks matching no button are definitive - the stale
+    /// flag and button proximity don't matter. Updated on every hook-cache
+    /// refresh from the last success timestamp.
+    /// </summary>
+    private static volatile bool hookButtonsRecent;
+    private static DateTime lastButtonSuccessAt = DateTime.MinValue;
     private static string lastTrayCacheLog = "";
 
     private sealed class TrayButtonInfo
@@ -286,6 +309,15 @@ public static class ProcessSuspenderApp
     }
 
     public static int PollMs { get { return pollMs; } }
+
+    /// <summary>True when at least one process/window target is locked.</summary>
+    public static bool HasLockedTargets()
+    {
+        lock (StateLock) return targetName != null || WindowTargets.Count > 0;
+    }
+
+    /// <summary>Raised after targets are added/removed so listeners (hooks, event watcher) can go idle.</summary>
+    public static event Action TargetsChanged;
 
     /// <summary>True when the configured freeze mode is Eco (low-power) instead of Suspend.</summary>
     public static bool IsEcoMode()
@@ -555,13 +587,16 @@ public static class ProcessSuspenderApp
         worker.Name = "ProcessSuspenderWorker";
         worker.Start();
         RestoreLockedProcesses();
+        try { NotifyTargetsChanged(); } catch { }
         Log("[INFO] ProcessSuspender started. Target: " + CurrentTargetDescription + ", poll: " + pollMs + "ms, mode: " + FreezeModeLabel);
     }
 
     public static void Stop()
     {
         running = false;
+        try { wakeEvent.Set(); } catch { }
         if (worker != null) worker.Join(3000);
+        try { StopEventWatcher(); } catch { }
         if (Config != null && Config.ResumeOnExit)
         {
             ResumeAll();
@@ -597,6 +632,7 @@ public static class ProcessSuspenderApp
         ApplyNeverSuspendList();
         ApplyEcoCaps();
         if (SettingsApplied != null) SettingsApplied();
+        NotifyTargetsChanged();
     }
 
     /// <summary>
@@ -758,6 +794,7 @@ public static class ProcessSuspenderApp
         }
         if (WindowTargets.Count > 0)
             Log("[INFO] Restored " + WindowTargets.Count + " locked window(s) from settings.");
+        if (WindowTargets.Count > 0) NotifyTargetsChanged();
     }
 
     public static void SetTargetByName(string name)
@@ -788,6 +825,7 @@ public static class ProcessSuspenderApp
             WindowTargets.Clear();
             Log("[INFO] Target set to process \"" + name + "\"");
         }
+        NotifyTargetsChanged();
     }
 
     /// <summary>Adds a window to the locked set without clearing the others (used by multi-select Pick).</summary>
@@ -817,6 +855,7 @@ public static class ProcessSuspenderApp
             added = true;
         }
         if (added) PersistLockedProcesses();
+        if (added) NotifyTargetsChanged();
     }
 
     /// <summary>Adds (or removes, if focused) the given window to the locked set. Returns a short result message.</summary>
@@ -859,6 +898,7 @@ public static class ProcessSuspenderApp
             }
         }
         PersistLockedProcesses();
+        NotifyTargetsChanged();
         return result;
     }
 
@@ -895,6 +935,7 @@ public static class ProcessSuspenderApp
             changed = true;
         }
         if (changed) PersistLockedProcesses();
+        if (changed) NotifyTargetsChanged();
     }
 
     private static WindowTarget FindWindowTarget(IntPtr hwnd)
@@ -936,35 +977,305 @@ public static class ProcessSuspenderApp
 
     /// <summary>
     /// The user pressed or released Alt+Tab / Win+Tab (a real switch gesture, as
-    /// detected by the keyboard hook). Both directions are now async: the hook
-    /// only flips flags, the resume runs on a background thread so a slow
-    /// NtResume/Eco-restore can never stall global keyboard/mouse input.
-    /// Resume still lands within milliseconds, well before the shell finishes
-    /// activating the target window.
-    /// Suspend on gesture START is deferred to the worker: NtSuspend inside the
-    /// low-level hook would stall the switcher UI.
+    /// detected by the keyboard hook). Gesture START only arms grace + origin
+    /// freeze bookkeeping. RELEASE never resumes blindly: the hook cannot know
+    /// which window was selected, and any speculative resume would run the game
+    /// while the user looks at another app. Instead the release only records
+    /// the pre-switch foreground and wakes the worker, which observes where the
+    /// shell actually landed: moved elsewhere = certain, the game stays frozen
+    /// (true zero); unchanged = ambiguous, the worker resumes the frozen target
+    /// without ever changing which window is in front. Esc-cancel and
+    /// mid-gesture clicks commit explicitly and skip everything. The low-level
+    /// hook only flips flags and reads the foreground - never blocks, never
+    /// touches StateLock.
     /// </summary>
     public static void OnSwitchStateChanged(bool active)
     {
         kbdSwitching = active;
         lastSwitchActivity = DateTime.UtcNow;
+        // Always logged (hook-safe queue): proves the keyboard hook saw the
+        // gesture even when there is nothing to resume. Missing [INPUT] lines
+        // after an Alt+Tab means the hook is dead or detection missed it.
+        try { Log("[INPUT] switch gesture " + (active ? "started" : "ended")); }
+        catch { }
         if (active)
         {
             pendingForegroundSuspend = true;
+            gestureCommitPid = 0; // new episode: drop any previous commit
+            // The Tab that STARTED this gesture was already counted by the hook
+            // (CountGestureTab runs in the same key-down callback, before this
+            // state change). Resetting to 0 threw that count away and made every
+            // ordinary single-Tab Alt+Tab look like a pure Alt tap, so the whole
+            // release decision was skipped. Seed at 1 instead (also covers the
+            // Tab-held-first path, where the gesture starts from the physical
+            // Tab state without a key-down on our hook).
+            gestureTabCount = 1;
+            releasePending = false;
         }
         else
         {
             pendingForegroundSuspend = false;
-            // Async: never block the low-level hook on resume work.
-            RequestResumeAsync("switch gesture released");
+            // Committed release (Esc-cancel back home, or click-selected window
+            // already foreground): the switch is decided without us. Skip the
+            // resume entirely - zero blip. A frozen foreground window self-heals
+            // via the focused path on the next tick, so this is always safe.
+            bool committed = false;
+            try
+            {
+                uint commit = gestureCommitPid;
+                gestureCommitPid = 0;
+                if (commit != 0)
+                {
+                    IntPtr fg = GetForegroundWindow();
+                    uint fgPid = 0;
+                    if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
+                    committed = fgPid == commit;
+                }
+            }
+            catch { committed = false; }
+            if (committed)
+            {
+                try { Log("[INPUT] switch gesture ended (committed, no resume)"); }
+                catch { }
+                return;
+            }
+            // Pure Alt-tap (no Tab navigation, no click): no switch could have
+            // happened. Skip everything - zero blip.
+            if (gestureTabCount == 0)
+            {
+                try { Log("[INPUT] switch gesture ended (no navigation, no resume)"); }
+                catch { }
+                return;
+            }
+            // Ambiguous: record the pre-switch foreground and let the worker
+            // decide once the shell has landed (see EvaluateReleasePending).
+            // Hook-safe: two syscalls + volatile writes + a wake signal.
+            try
+            {
+                IntPtr fg = GetForegroundWindow();
+                uint fgPid = 0;
+                if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
+                releaseOriginPid = originSwitchPid;
+                releaseFgBefore = fgPid;
+                releaseAt = DateTime.UtcNow;
+                releaseResumeAt = DateTime.MinValue;
+                releasePending = true;
+                try { wakeEvent.Set(); } catch { }
+            }
+            catch { }
         }
     }
 
     /// <summary>
-    /// Hooks call this (microseconds): record the request and resume on a
-    /// ThreadPool thread. The poll worker also drains it as a fallback.
+    /// Worker-side release decision (runs on the worker thread, never the hook).
+    /// The hook recorded the pre-switch foreground at Alt-up; here the worker
+    /// observes where the shell actually landed:
+    /// - foreground is a locked target: the switch landed home. Resume it if
+    ///   frozen (safety) and claim it. No yank needed - the shell did it.
+    /// - foreground moved to a real third-party window (not the origin, not a
+    ///   locked target, not transient NULL/explorer teardown): certain - the
+    ///   user picked another app. The game was never resumed, so there is
+    ///   nothing to refreeze: just clear. True zero.
+    /// - foreground unchanged (or transient): ambiguous. If the gesture started
+    ///   on the only locked target (user was leaving it), an ambiguous landing
+    ///   means they stayed away: keep it frozen. Otherwise (switching toward a
+    ///   frozen target) resume it once the grace expires - ReleaseIdleMs when
+    ///   the shell reports no foreground at all (activation stuck), the longer
+    ///   ReleaseAmbiguousMs for every other transient. No foreground yank: the
+    ///   shell owns the switch, and forcing the target forward used to replace
+    ///   the window the user actually picked. Suspend mode only: Eco processes
+    ///   keep running, so their activation always works and an unchanged
+    ///   foreground means "not the game" - leave throttled.
+    /// A new gesture abandons the pending decision (its release decides fresh).
     /// </summary>
-    private static void RequestResumeAsync(string reason)
+    private static void EvaluateReleasePending(uint fgPid)
+    {
+        if (!releasePending) return;
+        // The keyboard gesture is over by definition when this runs (the hook
+        // clears kbdSwitching before setting releasePending). Deliberately do
+        // NOT test mouseSwitching here: the mouse hook is uninstalled as soon
+        // as a click resumes the last frozen target, so its mouse-up can be
+        // lost and the flag can stay set. A stale mouse flag must never veto
+        // the user's keyboard switch decision.
+        if (kbdSwitching) { releasePending = false; return; }
+        if (!running) { releasePending = false; return; }
+        if (!enabled) { releasePending = false; return; }
+
+        HashSet<int> locked;
+        lock (StateLock)
+        {
+            locked = new HashSet<int>();
+            foreach (WindowTarget t in WindowTargets) locked.Add((int)t.Pid);
+            foreach (int pid in NamePids) locked.Add(pid);
+        }
+        if (locked.Count == 0) { releasePending = false; return; }
+
+        // Landed home: make sure it runs.
+        if (fgPid != 0 && locked.Contains((int)fgPid))
+        {
+            releasePending = false;
+            try { ResumeSuspended("switch landed on target"); } catch { }
+            return;
+        }
+
+        // Moved to a real other app: certain. Explorer/teardown and NULL are
+        // never verdicts (see below); anything else definitive is.
+        if (fgPid != 0 && fgPid != releaseFgBefore && !locked.Contains((int)fgPid) && !IsShellPid(fgPid))
+        {
+            // Nothing was resumed, so nothing to undo: the game was never
+            // woken by this release. True zero.
+            releasePending = false;
+            try { Log("[INPUT] switch committed elsewhere (no resume)"); }
+            catch { }
+            return;
+        }
+
+        // Ambiguous (unchanged or transient): the shell has not revealed the
+        // landing yet. Deliberately NO SetForegroundWindow here: the shell owns
+        // the switch, and yanking the target forward used to replace the window
+        // the user actually picked (GetForegroundWindow can still report
+        // NULL/transient right after Alt+Tab, which made the "activation
+        // failed" guess fire on ordinary switches).
+        //
+        // If the gesture STARTED on a locked target and it is the only target,
+        // the user was leaving it. An ambiguous landing means they did not come
+        // back (desktop/shell/cancelled animation): keep it frozen. The focused
+        // path resumes it if it does end up foreground, so this always heals.
+        uint origin = releaseOriginPid;
+        if (origin != 0 && locked.Count == 1 && locked.Contains((int)origin))
+        {
+            releasePending = false;
+            try { Log("[INPUT] switch away from target (ambiguous, stays frozen)"); } catch { }
+            return;
+        }
+
+        // Switching toward a frozen target. No foreground at all is the shell
+        // failing to activate the suspended window - resume after a short grace
+        // so the switch lands promptly. Any other ambiguous state (unchanged
+        // origin, explorer teardown) keeps the conservative grace: a clear
+        // "elsewhere" verdict arrives within ~10-100ms and wins first.
+        if (releaseResumeAt == DateTime.MinValue)
+            releaseResumeAt = releaseAt.AddMilliseconds(fgPid == 0 ? ReleaseIdleMs : ReleaseAmbiguousMs);
+        if (DateTime.UtcNow < releaseResumeAt) return;
+        releasePending = false;
+        if (IsEcoMode()) return; // running anyway: unchanged fg means not the game
+        try { ResumeSuspended("ambiguous switch release"); } catch { }
+    }
+
+    /// <summary>True for shell/teardown pids that are never switch verdicts (worker thread).</summary>
+    private static bool IsShellPid(uint pid)
+    {
+        if (pid == 0) return true;
+        try
+        {
+            string name = GetProcessName((int)pid);
+            return name.Equals("explorer", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("dwm", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("shellexperiencehost", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("applicationframehost", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Lightweight keepalive from the keyboard hook (microseconds, hook-safe):
+    /// refreshes the switch-gesture timestamp while the user keeps interacting
+    /// with the switcher (repeated Tab, arrow keys) so the gesture timeout
+    /// in ComputeHolding cannot expire mid-gesture and re-freeze the game
+    /// before Alt is released. No resume, no locks, just the timestamp.
+    /// </summary>
+    public static void TouchSwitchActivity()
+    {
+        lastSwitchActivity = DateTime.UtcNow;
+    }
+
+    // Foreground pid captured on a FRESH Alt/Win press (hook thread), i.e.
+    // before the system can open the switcher and move the foreground away
+    // from the window the user is leaving. Lets the worker freeze the origin
+    // window at gesture start even though GetForegroundWindow already reports
+    // the switcher by the time the worker drains the flag. Two fast syscalls,
+    // no locks, no logging: hook-safe. Stale values are harmless: the worker
+    // only reads it while draining a pending gesture-start suspend.
+    private static volatile uint originSwitchPid;
+
+    // Commit pid for the gesture release (hook thread writes, hook reads):    // Esc during a gesture = cancel (shell returns to the origin window);
+    // a mouse click during a gesture = committed selection. At release, when
+    // the foreground already equals this pid, the switch is over and decided
+    // without us - resuming would only create a pointless blip, so the release
+    // resume is skipped. Always safe: a frozen window that owns the foreground
+    // self-heals via the focused path on the next worker tick.
+    private static volatile uint gestureCommitPid;
+
+    /// <summary>Esc pressed mid-gesture: commit to the origin window (cancel).</summary>
+    public static void NoteEscDuringGesture()
+    {
+        try { if (originSwitchPid != 0) gestureCommitPid = originSwitchPid; }
+        catch { }
+    }
+
+    /// <summary>Mouse click mid-gesture: commit to the clicked window (selection).</summary>
+    public static void NoteClickDuringGesture(uint pid)
+    {
+        try { if (pid != 0) gestureCommitPid = pid; }
+        catch { }
+    }
+
+    /// <summary>Hook-safe read of the keyboard-gesture flag (for the mouse hook).</summary>
+    public static bool KbdGestureActive()
+    {
+        return kbdSwitching;
+    }
+
+    /// <summary>Hook-safe Tab counter for the release decision (see releasePending).</summary>
+    public static void CountGestureTab()
+    {
+        try { gestureTabCount++; }
+        catch { }
+    }
+
+    // Release-decision state (hook writes, worker reads): the hook records the
+    // pre-switch foreground + Tab count at Alt-up and wakes the worker, which
+    // decides in EvaluateReleasePending once the shell has landed.
+    private static volatile bool releasePending;
+    private static volatile uint releaseFgBefore;
+    private static volatile int gestureTabCount;
+    // Window that owned the foreground when the gesture started (the window
+    // being left). Lets the release decision tell "switching away from the
+    // target" (ambiguous landing = stayed away, keep it frozen) from
+    // "switching toward the frozen target" (ambiguous landing = activation
+    // stuck, resume it).
+    private static volatile uint releaseOriginPid;
+    private static DateTime releaseAt = DateTime.MinValue;
+    // Worker-chosen deadline for the ambiguous resume. Wake exactly at it
+    // instead of sleeping a whole poll interval past it.
+    private static DateTime releaseResumeAt = DateTime.MinValue;
+    // Ambiguous-release grace: with no landing yet, wait this long after Alt-up
+    // before resuming (lets a clear "switched elsewhere" verdict arrive first).
+    private const int ReleaseAmbiguousMs = 300;
+    // No foreground at all right after Alt-up ("pid 0"): the shell's activation
+    // is stuck on the frozen target (a running window takes the foreground
+    // within ~10-50ms). Resume sooner so the switch lands promptly; a false
+    // positive only leaves the target running for one recovery window.
+    private const int ReleaseIdleMs = 120;
+
+    /// <summary>Hook-safe snapshot of the about-to-be-left foreground (see above).</summary>
+    public static void NoteModifierHeld()
+    {
+        try
+        {
+            IntPtr fg = GetForegroundWindow();
+            uint pid = 0;
+            if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out pid);
+            originSwitchPid = pid;
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// The mouse hook calls this (microseconds): record the request and resume on a
+    /// ThreadPool thread (the low-level hook must never block).
+    /// </summary>
+    private static void ResumeTargetsAsync(string reason)
     {
         lock (PendingResumeLock)
         {
@@ -982,6 +1293,7 @@ public static class ProcessSuspenderApp
         catch { }
     }
 
+    /// <summary>Runs the queued resume request (ThreadPool; worker tick drains as fallback).</summary>
     private static void DrainPendingResume()
     {
         string reason;
@@ -996,8 +1308,8 @@ public static class ProcessSuspenderApp
         catch { }
     }
 
-    /// <summary>Suspends (or Eco-throttles) any locked target that still owns the foreground window.
-    /// Runs on the worker thread (deferred from the keyboard hook).</summary>
+    /// <summary>Suspends the locked target that still owns the foreground window
+    /// at gesture start (worker thread, deferred from the keyboard hook).</summary>
     private static void SuspendForegroundTarget(string reason)
     {
         IntPtr fg = GetForegroundWindow();
@@ -1005,30 +1317,57 @@ public static class ProcessSuspenderApp
         uint fgPid;
         GetWindowThreadProcessId(fg, out fgPid);
         if (fgPid == 0) return;
-        if (IsSelfPid(fgPid)) return;
+        SuspendTargetPid((int)fgPid, reason);
+    }
+
+    /// <summary>Suspends the gesture origin window (captured at Alt/Win press,
+    /// before the switcher stole the foreground). Skipped when the origin is
+    /// already foreground again (user cancelled back) - the normal focused
+    /// logic owns that case. Runs on the worker thread.</summary>
+    private static void SuspendOriginTarget(string reason)
+    {
+        uint origin = originSwitchPid;
+        if (origin == 0) return;
+        try
+        {
+            IntPtr fg = GetForegroundWindow();
+            uint fgPid = 0;
+            if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
+            if (fgPid == origin) return; // back home (or never left): don't touch
+        }
+        catch { }
+        SuspendTargetPid((int)origin, reason);
+    }
+
+    /// <summary>Shared freeze-one-pid body for the deferred gesture-start suspends.
+    /// Caller is the worker thread (may block briefly on StateLock).</summary>
+    private static void SuspendTargetPid(int pid, string reason)
+    {
+        if (pid <= 0) return;
+        if (IsSelfPid((uint)pid)) return;
         bool eco = IsEcoMode();
         IntPtr h = IntPtr.Zero;
         lock (StateLock)
         {
-            if (!Handles.ContainsKey((int)fgPid) || IsFrozenLocked((int)fgPid)) return;
-            h = Handles[(int)fgPid];
+            if (!Handles.ContainsKey(pid) || IsFrozenLocked(pid)) return;
+            h = Handles[pid];
         }
         if (h == IntPtr.Zero) return;
-        if (IsNeverSuspendPid(fgPid)) return;
+        if (IsNeverSuspendPid((uint)pid)) return;
         if (eco)
         {
             lock (StateLock)
             {
-                if (!Handles.TryGetValue((int)fgPid, out h)) return;
-                if (IsFrozenLocked((int)fgPid)) return;
-                ApplyEcoLocked((int)fgPid, h);
+                if (!Handles.TryGetValue(pid, out h)) return;
+                if (IsFrozenLocked(pid)) return;
+                ApplyEcoLocked(pid, h);
             }
             return;
         }
         if (NtSuspendProcess(h) == 0)
         {
-            lock (StateLock) Suspended.Add((int)fgPid);
-            Log("[SUSPEND] " + DescribeProcess((int)fgPid) + " (pid " + fgPid + ") - " + reason);
+            lock (StateLock) Suspended.Add(pid);
+            Log("[SUSPEND] " + DescribeProcess(pid) + " (pid " + pid + ") - " + reason);
         }
     }
 
@@ -1038,7 +1377,7 @@ public static class ProcessSuspenderApp
     /// no UIA, no EnumWindows, no logging here - just cached rects/handles.
     /// Only the target's own taskbar button (or its window) resumes it; clicks
     /// elsewhere are ignored so a suspended game stays frozen. Resume itself
-    /// runs on a background thread (see RequestResumeAsync).
+    /// runs on a background thread (see ResumeTargetsAsync).
     /// </summary>
     public static void OnMouseSwitchEvent(bool down, int x, int y)
     {
@@ -1070,7 +1409,7 @@ public static class ProcessSuspenderApp
             if (!isSwitch) return;
             mouseSwitching = true;
             lastSwitchActivity = DateTime.UtcNow;
-            RequestResumeAsync("mouse click on target/taskbar (" + match + " at " + x + "," + y + ")");
+            ResumeTargetsAsync("mouse click on target/taskbar (" + match + " at " + x + "," + y + ")");
             return;
         }
         mouseSwitching = false;
@@ -1171,6 +1510,11 @@ public static class ProcessSuspenderApp
         {
             if (hit == null)
             {
+                // Freshly verified cache (success within 5s): complete by
+                // definition, so a click matching no button is definitively not
+                // the target (Start, tray, clock, gaps...) - neither the stale
+                // flag nor button proximity matters.
+                if (hookButtonsRecent) { match = ""; return false; }
                 // The target's own button is currently enumerated: a click matching
                 // no button is definitively not the target (Start, tray, clock,
                 // gaps...), even when the cache is otherwise stale (e.g. a failed
@@ -1219,8 +1563,11 @@ public static class ProcessSuspenderApp
             match = "";
             return false; // button of a different app: definitely not ours
         }
-        // Button could not be mapped (no AppPath, no usable name): treat as
-        // potential target so a click never leaves the game stuck suspended.
+        // Button could not be mapped (no AppPath, no usable name): if the
+        // target's own button is enumerated elsewhere, this entry isn't it -
+        // ignore. Otherwise treat it as a potential target so a click never
+        // leaves the game stuck suspended.
+        if (hookTargetButtonPresent) { match = ""; return false; }
         match = "fallback unmappable button";
         return true;
         }
@@ -1272,6 +1619,28 @@ public static class ProcessSuspenderApp
                 // opaque AppId with no exe-name match: undecided, try title below
             }
         }
+        // (1b) button label vs target exe file name ("Notepad" vs "notepad.exe",
+        // exact match only). Packaged apps expose opaque AppIds ("...!App") and
+        // app-name-only labels, so neither the AppId nor the title comparison
+        // can map them - yet the label equals the exe base name.
+        if (haveExe && btnName.Length > 0)
+        {
+            string nb = StripButtonSuffixes(btnName).Trim().ToLowerInvariant();
+            if (nb.Length > 0)
+            {
+                foreach (string t in exeList)
+                {
+                    int slash = t.LastIndexOf('/');
+                    string file = slash >= 0 ? t.Substring(slash + 1) : t;
+                    if (file.Length == 0) continue;
+                    string noExt = file.EndsWith(".exe", StringComparison.Ordinal)
+                        ? file.Substring(0, file.Length - 4) : file;
+                    if (nb.Equals(file, StringComparison.Ordinal)
+                        || (noExt.Length > 0 && nb.Equals(noExt, StringComparison.Ordinal)))
+                        return "appid";
+                }
+            }
+        }
         // (2) title match, tolerant of clipped labels and Win10 suffixes
         // (" - 1 running window", " pinned"). Prefix matching needs at least 3
         // overlapping chars so short titles can't collide ("War" vs "Warframe").
@@ -1319,6 +1688,7 @@ public static class ProcessSuspenderApp
         catch { idle = false; }
         if (idle) return;
         try { RefreshTaskbarButtons(); } catch { }
+        try { hookButtonsRecent = (DateTime.UtcNow - lastButtonSuccessAt).TotalSeconds < 5; } catch { }
         try { RefreshHookTaskbarRects(); } catch { }
         List<IntPtr> hwnds = new List<IntPtr>();
         List<IntPtr> mains = new List<IntPtr>();
@@ -1565,7 +1935,12 @@ public static class ProcessSuspenderApp
 
     private static void RefreshTaskbarButtons()
     {
-        if ((DateTime.UtcNow - taskbarButtonsCached).TotalMilliseconds < 1000) return;
+        // Adaptive cadence: the UIA walk is the most expensive periodic work
+        // here (tens of ms), and clicks only need fresh buttons around window
+        // switching. Refresh every 1s for 15s after any foreground change,
+        // every 4s once the foreground is stable.
+        long intervalMs = (DateTime.UtcNow - lastFgChangeAt).TotalSeconds < 15 ? 1000 : 4000;
+        if ((DateTime.UtcNow - taskbarButtonsCached).TotalMilliseconds < intervalMs) return;
         taskbarButtonsCached = DateTime.UtcNow;
         // Enumerate buttons on every taskbar (primary + secondary monitors): a
         // click on another app's button on a secondary taskbar must be ignored too.
@@ -1621,13 +1996,25 @@ public static class ProcessSuspenderApp
         }
         if (trayMode == TrayMode.Uia || trayMode == TrayMode.Win32Button)
         {
+            bool attempted = false;
             foreach (IntPtr bar in bars)
             {
+                // The bar list is cached for 2s and can hold a dead handle
+                // (Explorer hiccup, secondary monitor detached). Filling a dead
+                // bar always fails and wrongly marks the whole cache stale -
+                // which is exactly what woke the game on clicks near (but not
+                // on) real buttons. Skip dead bars without failing.
+                bool alive = false;
+                try { alive = IsWindow(bar); }
+                catch { alive = false; }
+                if (!alive) continue;
+                attempted = true;
                 bool ok;
                 if (trayMode == TrayMode.Uia) ok = FillFromUia(bar);
                 else ok = FillFromWin32(bar);
                 if (!ok) failed = true;
             }
+            if (!attempted) failed = true; // no live bar to verify against
         }
         else
         {
@@ -1664,6 +2051,7 @@ public static class ProcessSuspenderApp
             }
         }
         taskbarButtonsStale = failed;
+        if (!failed) lastButtonSuccessAt = DateTime.UtcNow;
         LogTrayCache();
     }
 
@@ -1678,7 +2066,7 @@ public static class ProcessSuspenderApp
             lock (TaskbarLock) sysAreas = hookSystemRects.Count;
             string s = "trayMode=" + trayMode + " buttons=" + buttons + " stale=" + taskbarButtonsStale
                 + " targetExe=" + exes + " targetTitles=" + titles + " sysAreas=" + sysAreas
-                + " targetBtn=" + hookTargetButtonPresent;
+                + " targetBtn=" + hookTargetButtonPresent + " recent=" + hookButtonsRecent;
             if (s != lastTrayCacheLog)
             {
                 lastTrayCacheLog = s;
@@ -2052,7 +2440,7 @@ public static class ProcessSuspenderApp
 
     public static void Log(string msg)
     {
-        string line = DateTime.Now.ToString("HH:mm:ss") + " " + msg;
+        string line = DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg;
         lock (LogLock)
         {
             LogBuffer.Add(line);
@@ -2088,6 +2476,144 @@ public static class ProcessSuspenderApp
         lock (LogLock) return LogBuffer.ToArray();
     }
 
+    // ---- Event-driven wakeups (foreground / minimize WinEvents) ----
+    // Polling alone can lag a state change by up to one poll interval. These
+    // hooks wake the worker the moment the foreground moves or a window
+    // minimizes, so evaluation starts in milliseconds. The poll interval
+    // remains as a fallback (a missed event can never stick), and all safety
+    // gates (switch grace, settle delay, post-restore recovery) are unchanged.
+    private delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObj, int idChild, uint tid, uint time);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWinEventHook(uint evMin, uint evMax, IntPtr hmod, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWinEvent(IntPtr hook);
+
+    private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private const uint EVENT_SYSTEM_MINIMIZESTART = 0x0016;
+    private const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017;
+    private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+    private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+
+    // Rooted so the GC can never collect the callback while hooked.
+    private static readonly WinEventProc winEventProc = WinEventCallback;
+    private static IntPtr fgEventHook = IntPtr.Zero;
+    private static IntPtr minEventHook = IntPtr.Zero;
+    private static readonly AutoResetEvent wakeEvent = new AutoResetEvent(false);
+    // Last MINIMIZESTART window + timestamp: lets the worker treat that exact
+    // window as minimized immediately instead of waiting for the ~1s
+    // minimized-state refresh. Guarded by MinEventLock; the callback only
+    // records and wakes, never blocks on worker locks.
+    private static readonly object MinEventLock = new object();
+    private static IntPtr lastMinHwnd = IntPtr.Zero;
+    private static DateTime lastMinAt = DateTime.MinValue;
+
+    private static void StartEventWatcher()
+    {
+        StopEventWatcher();
+        try { fgEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS); }
+        catch { fgEventHook = IntPtr.Zero; }
+        try { minEventHook = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, IntPtr.Zero, winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS); }
+        catch { minEventHook = IntPtr.Zero; }
+        if (fgEventHook == IntPtr.Zero && minEventHook == IntPtr.Zero)
+            Log("[WARN] WinEvent hooks failed - falling back to polling only.");
+    }
+
+    private static void StopEventWatcher()
+    {
+        if (fgEventHook != IntPtr.Zero)
+        {
+            try { UnhookWinEvent(fgEventHook); }
+            catch { }
+            fgEventHook = IntPtr.Zero;
+        }
+        if (minEventHook != IntPtr.Zero)
+        {
+            try { UnhookWinEvent(minEventHook); }
+            catch { }
+            minEventHook = IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Start/stop WinEvent watchers to match whether any target is locked.</summary>
+    public static void EnsureEventWatcherState()
+    {
+        if (HasLockedTargets())
+        {
+            if (fgEventHook == IntPtr.Zero && minEventHook == IntPtr.Zero)
+                try { StartEventWatcher(); } catch { }
+        }
+        else
+        {
+            try { StopEventWatcher(); } catch { }
+        }
+    }
+
+    private static void NotifyTargetsChanged()
+    {
+        try { wakeEvent.Set(); } catch { }
+        try { EnsureEventWatcherState(); } catch { }
+        try { if (TargetsChanged != null) TargetsChanged(); } catch { }
+    }
+
+    /// <summary>
+    /// Runs on a system thread: record the minimize window and wake the worker.
+    /// Must never throw (an unhandled hook exception would tear down the
+    /// process) and never touch worker locks, Process, UIA or Log.
+    /// </summary>
+    private static void WinEventCallback(IntPtr hook, uint ev, IntPtr hwnd, int idObj, int idChild, uint tid, uint time)
+    {
+        try
+        {
+            if (ev == EVENT_SYSTEM_MINIMIZESTART && hwnd != IntPtr.Zero)
+            {
+                try
+                {
+                    lock (MinEventLock)
+                    {
+                        lastMinHwnd = hwnd;
+                        lastMinAt = DateTime.UtcNow;
+                    }
+                }
+                catch { }
+            }
+            try { wakeEvent.Set(); }
+            catch { }
+        }
+        catch { }
+    }
+
+    /// <summary>True when hwnd was minimize-reported within the last 2s (worker thread).</summary>
+    private static bool IsFreshMinEvent(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        lock (MinEventLock)
+        {
+            return hwnd == lastMinHwnd && (DateTime.UtcNow - lastMinAt).TotalMilliseconds < 2000;
+        }
+    }
+
+    /// <summary>True when pid owns the minimize-reported window (worker thread).</summary>
+    private static bool IsFreshMinPid(int pid)
+    {
+        if (pid <= 0) return false;
+        IntPtr hwnd = IntPtr.Zero;
+        lock (MinEventLock)
+        {
+            if ((DateTime.UtcNow - lastMinAt).TotalMilliseconds >= 2000) return false;
+            hwnd = lastMinHwnd;
+        }
+        if (hwnd == IntPtr.Zero) return false;
+        try
+        {
+            uint wpid;
+            if (GetWindowThreadProcessId(hwnd, out wpid) != 0 && (int)wpid == pid)
+                return true;
+        }
+        catch { }
+        return false;
+    }
+
     private static void WorkerLoop()
     {
         DateTime lastFlush = DateTime.UtcNow;
@@ -2110,15 +2636,41 @@ public static class ProcessSuspenderApp
                 lastFlush = DateTime.UtcNow;
                 try { FlushLogToFile(); } catch { }
             }
-            Thread.Sleep(pollMs);
+            // Event-driven wake with poll fallback: WinEvents cut reaction to
+            // milliseconds; the wait cap keeps every safety net (child scans,
+            // audio remute, log flush, missed events) on schedule.
+            // When there is no locked target we don't need the foreground poll; hold
+            // off longer and wake instantly when one is added (NotifyTargetsChanged).
+            int waitMs = HasLockedTargets() ? pollMs : 2000;
+            if (releasePending)
+            {
+                // Wake exactly when the release grace expires. Sleeping the
+                // full poll interval past the deadline added up to 250ms of
+                // frozen-window lag on every switch back to the target.
+                DateTime due = releaseResumeAt;
+                int remaining = due == DateTime.MinValue
+                    ? 25
+                    : (int)Math.Ceiling((due - DateTime.UtcNow).TotalMilliseconds);
+                if (remaining < waitMs) waitMs = Math.Max(1, remaining);
+            }
+            try { wakeEvent.WaitOne(waitMs); }
+            catch { try { Thread.Sleep(waitMs); } catch { } }
         }
         try { FlushLogToFile(); } catch { }
     }
 
     private static void RunWorkerTick(int tick)
     {
+        // No locked target: nothing to freeze/resume/watch. Stay idle and keep
+        // the caches untouched until a target is locked.
+        if (!HasLockedTargets())
+        {
+            releasePending = false;
+            return;
+        }
         if (!enabled)
         {
+            releasePending = false;
             ResumeAll();
             return;
         }
@@ -2132,6 +2684,7 @@ public static class ProcessSuspenderApp
         if (pendingForegroundSuspend)
         {
             pendingForegroundSuspend = false;
+            try { SuspendOriginTarget("switch gesture started (origin)"); } catch { }
             try { SuspendForegroundTarget("switch gesture started"); } catch { }
         }
         RefreshHookCache();
@@ -2142,8 +2695,16 @@ public static class ProcessSuspenderApp
         if (fgPid != lastFgPid)
         {
             lastFgPid = fgPid;
+            lastFgChangeAt = DateTime.UtcNow;
             Log("[FG] foreground: pid " + fgPid + " (" + DescribeProcess((int)fgPid)
                 + "), title=\"" + GetWindowTitle(fg) + "\"");
+        }
+
+        // Post-release switch decision (see EvaluateReleasePending): runs on the
+        // fresh foreground reading, before the mode ticks below.
+        if (releasePending)
+        {
+            try { EvaluateReleasePending(fgPid); } catch { }
         }
 
         DateTime now = DateTime.UtcNow;
@@ -2340,6 +2901,16 @@ public static class ProcessSuspenderApp
     /// </summary>
     private static bool ComputeHolding()
     {
+        // Self-heal a stale mouse gesture. The mouse hook is uninstalled as
+        // soon as a click resumes the last frozen target (AnyFrozen becomes
+        // false), so the matching mouse-up can be lost. Left set, the flag
+        // would keep the target running (holding) until the 30s gesture
+        // timeout - and it used to veto keyboard release decisions entirely.
+        if (mouseSwitching && !IsLeftButtonPhysicallyDown())
+        {
+            mouseSwitching = false;
+            mouseDownWasSwitch = false;
+        }
         bool switchingNow = kbdSwitching || mouseSwitching;
         bool holding = switchingNow;
         if (switchingNow && (DateTime.UtcNow - lastSwitchActivity).TotalMilliseconds > SwitchGestureTimeoutMs)
@@ -2351,6 +2922,14 @@ public static class ProcessSuspenderApp
         if (!holding && (DateTime.UtcNow - lastSwitchActivity).TotalMilliseconds < PostSwitchGraceMs)
             holding = true;
         return holding;
+    }
+
+    /// <summary>Physical left-button state (worker thread): heals a mouse-up
+    /// lost when the mouse hook was uninstalled mid-click.</summary>
+    private static bool IsLeftButtonPhysicallyDown()
+    {
+        try { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
+        catch { return true; } // on error keep the cached flag (conservative)
     }
 
     /// <summary>Foreground pid, overridden by FOCUSLOCK_TEST_FGPID when set.</summary>
@@ -2390,12 +2969,18 @@ public static class ProcessSuspenderApp
                 // targets recover instead of going permanently inert.
                 if (!Handles.ContainsKey(pid)) OpenHandleLocked(pid);
                 bool focused = (int)fgPid == pid && !kbdSwitching; // gesture: focus is about to move; never resume mid-gesture
-                if (ignoreMinimize && !focused)
-                {
-                    try { if (IsIconic(t.Hwnd)) focused = true; } catch { }
-                }
+                // Minimizing is an explicit, stable signal (unlike a focus change
+                // that may flicker during switch animations), so a minimized
+                // target skips the settle delay in ApplyLocked and suspends
+                // almost immediately. A minimized window can also keep owning
+                // the foreground (nothing else takes it), so it counts as
+                // defocused too - unless ignoring minimizes, which keeps it running.
+                bool minimized = false;
+                try { minimized = IsIconic(t.Hwnd); } catch { }
+                if (!minimized) minimized = IsFreshMinEvent(t.Hwnd);
+                if (minimized) focused = ignoreMinimize;
                 bool wasSuspended = Suspended.Contains(pid) || Throttled.Contains(pid);
-                ApplyLocked(pid, focused, fgPid, holding);
+                ApplyLocked(pid, focused, fgPid, holding, minimized && !ignoreMinimize);
                 if (!focused && !holding)
                 {
                     // Re-scan only on the suspend transition or every 2s, never on every tick.
@@ -2499,7 +3084,7 @@ public static class ProcessSuspenderApp
             // Snapshot names are free; the old path paid a Process lookup per child.
             if (IsNeverSuspendName(NameOf(snap, cid))) continue;
             OpenHandleLocked(cid);
-            ApplyLocked(cid, false, 0, false);
+            ApplyLocked(cid, false, 0, false, false);
             SuspendDescendants(cid, snap, seen);
         }
     }
@@ -2535,9 +3120,15 @@ public static class ProcessSuspenderApp
             foreach (int pid in Handles.Keys.ToList())
             {
                 bool focused = fgPid != 0 && (int)fgPid == pid && !kbdSwitching; // same gesture guard as window mode
-                if (ignoreMinimize && !focused) focused = Minimized.Contains(pid);
+                // Minimized set is refreshed every ~1s: same fast-path as window
+                // mode, just with slightly coarser minimize detection. A
+                // minimized pid counts as defocused even if it still owns the
+                // foreground.
+                bool minimized = Minimized.Contains(pid);
+                if (!minimized) minimized = IsFreshMinPid(pid);
+                if (minimized) focused = ignoreMinimize;
                 bool wasSuspended = Suspended.Contains(pid) || Throttled.Contains(pid);
-                ApplyLocked(pid, focused, fgPid, holding);
+                ApplyLocked(pid, focused, fgPid, holding, minimized && !ignoreMinimize);
                 if (!focused && !holding)
                 {
                     if (!wasSuspended || doChildScan) toSuspendChildren.Add(pid);
@@ -2552,7 +3143,7 @@ public static class ProcessSuspenderApp
         foreach (int pid in toDropChildren) DropChildrenOf(pid);
     }
 
-    private static void ApplyLocked(int pid, bool focused, uint fgPid, bool hold)
+    private static void ApplyLocked(int pid, bool focused, uint fgPid, bool hold, bool minimized)
     {
         // Stop() may have resumed everything and released StateLock while this tick
         // was already in flight; never suspend after shutdown began.
@@ -2598,40 +3189,16 @@ public static class ProcessSuspenderApp
                 unfocusedSince[pid] = DateTime.UtcNow;
         }
 
-        if (!focused && !isFrozen && !hold && DefocusSettled(pid) && PastRecovery(pid))
+        // A minimized target suspends without the anti-flap settle delay:
+        // minimizing is explicit and stable, unlike a focus change that may
+        // flicker mid-switch. The switch grace still applies, so a click that
+        // is restoring the window can't freeze it mid-animation; plain
+        // defocus keeps both protections. The post-restore recovery window
+        // guards against re-freezing a game that was just restored and is
+        // still painting its first frames back.
+        if (!focused && !isFrozen && !hold && PastRecovery(pid) && (minimized || DefocusSettled(pid)))
         {
-            if (IsNeverSuspendPid((uint)pid))
-            {
-                // The whitelist is the last line of defence: never suspend these,
-                // even if the target was locked before the entry was added.
-                if (WarnedPids.Add(pid))
-                    Log("[WARN] " + DescribeProcess(pid) + " (pid " + pid
-                        + ") is in the never-suspend list - skipping suspend.");
-                return;
-            }
-            if (IsSelfPid((uint)pid)) return;
-            if (eco)
-            {
-                ApplyEcoLocked(pid, h);
-            }
-            else
-            {
-                if (NtSuspendProcess(h) == 0)
-                {
-                    Suspended.Add(pid);
-                    Log("[SUSPEND] " + DescribeProcess(pid) + " (pid " + pid + ")");
-                }
-                else
-                {
-                    // Handle went stale (target restarting, access revoked). Close it so
-                    // the next tick reopens fresh instead of dropping the lock target.
-                    CloseHandle(h);
-                    Handles.Remove(pid);
-                    HandleStartTimes.Remove(pid);
-                    Suspended.Remove(pid);
-                    WarnedPids.Remove(pid);
-                }
-            }
+            FreezeLocked(pid, h, eco, minimized ? " - minimized" : "");
         }
         else if (focused && isFrozen)
         {
@@ -2657,6 +3224,48 @@ public static class ProcessSuspenderApp
                 RestoreEcoLocked(pid, h);
                 lastRestoreAt[pid] = DateTime.UtcNow;
                 Log("[ECO-RESTORE] " + DescribeProcess(pid) + " (pid " + pid + ")");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Freezes one pid right now, bypassing switch grace / settle / recovery.
+    /// Used by the normal defocus path (after its gates pass) and by the
+    /// release-decision fast paths (which confirmed the switch landed elsewhere).
+    /// Caller must hold StateLock.
+    /// </summary>
+    private static void FreezeLocked(int pid, IntPtr h, bool eco, string reasonSuffix)
+    {
+        if (IsNeverSuspendPid((uint)pid))
+        {
+            // The whitelist is the last line of defence: never suspend these,
+            // even if the target was locked before the entry was added.
+            if (WarnedPids.Add(pid))
+                Log("[WARN] " + DescribeProcess(pid) + " (pid " + pid
+                    + ") is in the never-suspend list - skipping suspend.");
+            return;
+        }
+        if (IsSelfPid((uint)pid)) return;
+        if (eco)
+        {
+            ApplyEcoLocked(pid, h);
+        }
+        else
+        {
+            if (NtSuspendProcess(h) == 0)
+            {
+                Suspended.Add(pid);
+                Log("[SUSPEND] " + DescribeProcess(pid) + " (pid " + pid + ")" + reasonSuffix);
+            }
+            else
+            {
+                // Handle went stale (target restarting, access revoked). Close it so
+                // the next tick reopens fresh instead of dropping the lock target.
+                CloseHandle(h);
+                Handles.Remove(pid);
+                HandleStartTimes.Remove(pid);
+                Suspended.Remove(pid);
+                WarnedPids.Remove(pid);
             }
         }
     }

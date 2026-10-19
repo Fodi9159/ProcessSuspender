@@ -104,7 +104,10 @@ Services are whitelisted by their host process name (e.g. `svchost`). Whitelisti
 ## How it works
 
 Every poll interval it compares the foreground window's PID against the target. On focus
-loss it freezes the target; on return it restores it. Two freeze modes (tray ->
+loss it freezes the target; on return it restores it. Foreground-change and
+minimize system events additionally wake the evaluator instantly, so reaction
+takes milliseconds; the poll interval remains as a fallback so a missed event
+can never stick. Two freeze modes (tray ->
 Freeze mode, or Settings -> Behavior):
 
 - `Suspend` - `NtSuspendProcess` / `NtResumeProcess` (~0% CPU, game fully frozen).
@@ -119,11 +122,17 @@ Child processes (launchers, helpers) are frozen/throttled too. CPU cost is negli
 **Why the input hooks:** a suspended process can never receive window activation, so
 Windows silently refuses to give it focus when you alt-tab back or click its taskbar
 button - the game stays frozen even though you are "looking at it". Process Suspender therefore
-watches the keyboard and mouse via low-level hooks:
+watches the keyboard and mouse via low-level hooks (on a dedicated thread, so nothing the
+app's window or settings do can delay system input):
 
-- The moment you release **Alt+Tab** or **Win+Tab** while the game is suspended, it unfreezes
-  the game so your switch lands on a running game. If you switch to a different window
-  instead, the game is re-suspended on the next poll.
+- When you release **Alt+Tab** or **Win+Tab** after a switch involving the game, a background
+  worker checks where the shell actually landed: on the game, it is resumed; on another app,
+  nothing happens (the game stays frozen - true zero); switching away from the game and leaving
+  it ambiguous (desktop/shell) keeps it frozen, while switching toward it resumes the frozen
+  game after a short grace (120 ms when the shell reports no foreground, i.e. activation is
+  stuck, otherwise 300 ms) so the switch can land. Process Suspender never changes which window
+  is in front - Alt+Tab always lands exactly where you pointed it. Browsing the switcher with
+  Alt held keeps the game frozen.
 - The same happens when you click the game's **taskbar button** or directly over the
   game window. Clicks are detected with a fast cached check so the mouse never lags;
   only the target's own button wakes it - clicks on other apps, the tray, clock or

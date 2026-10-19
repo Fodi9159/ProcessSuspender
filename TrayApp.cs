@@ -36,23 +36,24 @@ public class TrayApp : ApplicationContext
         _inputHook = new InputHook();
         _inputHook.SwitchStateChanged += delegate(bool active) { ProcessSuspenderApp.OnSwitchStateChanged(active); };
         _inputHook.MouseSwitchEvent += delegate(bool down, int x, int y) { ProcessSuspenderApp.OnMouseSwitchEvent(down, x, y); };
-        // On-demand mouse hook: installed only while something is frozen.
-        // A global WH_MOUSE_LL hook forces every mouse movement through this
-        // process; when idle (nothing frozen, freeze off) that context switch
-        // is pure cursor overhead. Runs on the UI thread so install/uninstall
-        // happens on the hook's owning thread.
+        // On-demand hooks: both hooks are uninstalled entirely when there is no
+        // locked target, so an idle app does no input work. The mouse hook is
+        // additionally gated on something being frozen (avoids cursor overhead).
+        ProcessSuspenderApp.TargetsChanged += delegate
+        {
+            try { UpdateHookState(); }
+            catch { }
+        };
         _hookSyncTimer = new Timer();
         _hookSyncTimer.Interval = 500;
         _hookSyncTimer.Tick += delegate
         {
-            try
-            {
-                bool want = ProcessSuspenderApp.Enabled && ProcessSuspenderApp.AnyFrozen;
-                if (_inputHook != null) _inputHook.SetMouseEnabled(want);
-            }
+            try { UpdateHookState(); }
             catch { }
         };
         _hookSyncTimer.Start();
+        try { UpdateHookState(); }
+        catch { }
         Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
         try { Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged; } catch { }
 
@@ -177,6 +178,19 @@ public class TrayApp : ApplicationContext
         mi.Click += delegate { SetPoll(ms); };
         parent.DropDownItems.Add(mi);
         return mi;
+    }
+
+    private void UpdateHookState()
+    {
+        try
+        {
+            if (_inputHook == null) return;
+            bool hasTargets = ProcessSuspenderApp.HasLockedTargets();
+            _inputHook.SetEnabled(hasTargets);
+            bool want = hasTargets && ProcessSuspenderApp.Enabled && ProcessSuspenderApp.AnyFrozen;
+            _inputHook.SetMouseEnabled(want);
+        }
+        catch { }
     }
 
     private void RefreshChecks()
