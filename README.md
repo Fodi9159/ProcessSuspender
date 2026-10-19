@@ -129,8 +129,8 @@ app's window or settings do can delay system input):
   worker checks where the shell actually landed: on the game, it is resumed; on another app,
   nothing happens (the game stays frozen - true zero); switching away from the game and leaving
   it ambiguous (desktop/shell) keeps it frozen, while switching toward it resumes the frozen
-  game after a short grace (120 ms when the shell reports no foreground, i.e. activation is
-  stuck, otherwise 300 ms) so the switch can land. Process Suspender never changes which window
+  game immediately if the shell reports no foreground (activation is stuck), otherwise after a
+  300 ms grace, so the switch can land. Process Suspender never changes which window
   is in front - Alt+Tab always lands exactly where you pointed it. Browsing the switcher with
   Alt held keeps the game frozen.
 - The same happens when you click the game's **taskbar button** or directly over the

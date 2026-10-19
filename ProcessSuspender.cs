@@ -1058,7 +1058,6 @@ public static class ProcessSuspenderApp
                 releaseOriginPid = originSwitchPid;
                 releaseFgBefore = fgPid;
                 releaseAt = DateTime.UtcNow;
-                releaseResumeAt = DateTime.MinValue;
                 releasePending = true;
                 try { wakeEvent.Set(); } catch { }
             }
@@ -1079,13 +1078,14 @@ public static class ProcessSuspenderApp
     /// - foreground unchanged (or transient): ambiguous. If the gesture started
     ///   on the only locked target (user was leaving it), an ambiguous landing
     ///   means they stayed away: keep it frozen. Otherwise (switching toward a
-    ///   frozen target) resume it once the grace expires - ReleaseIdleMs when
-    ///   the shell reports no foreground at all (activation stuck), the longer
-    ///   ReleaseAmbiguousMs for every other transient. No foreground yank: the
-    ///   shell owns the switch, and forcing the target forward used to replace
-    ///   the window the user actually picked. Suspend mode only: Eco processes
-    ///   keep running, so their activation always works and an unchanged
-    ///   foreground means "not the game" - leave throttled.
+    ///   frozen target) resume it immediately when the shell reports no
+    ///   foreground at all (activation stuck), or once the conservative
+    ///   ReleaseAmbiguousMs grace expires for every other transient. No
+    ///   foreground yank: the shell owns the switch, and forcing the target
+    ///   forward used to replace the window the user actually picked. Suspend
+    ///   mode only: Eco processes keep running, so their activation always
+    ///   works and an unchanged foreground means "not the game" - leave
+    ///   throttled.
     /// A new gesture abandons the pending decision (its release decides fresh).
     /// </summary>
     private static void EvaluateReleasePending(uint fgPid)
@@ -1150,13 +1150,22 @@ public static class ProcessSuspenderApp
         }
 
         // Switching toward a frozen target. No foreground at all is the shell
-        // failing to activate the suspended window - resume after a short grace
-        // so the switch lands promptly. Any other ambiguous state (unchanged
-        // origin, explorer teardown) keeps the conservative grace: a clear
-        // "elsewhere" verdict arrives within ~10-100ms and wins first.
-        if (releaseResumeAt == DateTime.MinValue)
-            releaseResumeAt = releaseAt.AddMilliseconds(fgPid == 0 ? ReleaseIdleMs : ReleaseAmbiguousMs);
-        if (DateTime.UtcNow < releaseResumeAt) return;
+        // failing to activate the suspended window - resume immediately so the
+        // switch lands without the grace delay. If the landing turns out to be
+        // another app after all, the normal defocus path re-suspends the target;
+        // no window is ever brought forward.
+        if (fgPid == 0)
+        {
+            releasePending = false;
+            if (IsEcoMode()) return;
+            try { ResumeSuspended("no-foreground switch release"); } catch { }
+            return;
+        }
+
+        // Any other ambiguous state (unchanged origin, explorer teardown) keeps
+        // the conservative grace: a clear "elsewhere" verdict arrives within
+        // ~10-100ms and wins first.
+        if ((DateTime.UtcNow - releaseAt).TotalMilliseconds < ReleaseAmbiguousMs) return;
         releasePending = false;
         if (IsEcoMode()) return; // running anyway: unchanged fg means not the game
         try { ResumeSuspended("ambiguous switch release"); } catch { }
@@ -1246,17 +1255,10 @@ public static class ProcessSuspenderApp
     // stuck, resume it).
     private static volatile uint releaseOriginPid;
     private static DateTime releaseAt = DateTime.MinValue;
-    // Worker-chosen deadline for the ambiguous resume. Wake exactly at it
-    // instead of sleeping a whole poll interval past it.
-    private static DateTime releaseResumeAt = DateTime.MinValue;
     // Ambiguous-release grace: with no landing yet, wait this long after Alt-up
     // before resuming (lets a clear "switched elsewhere" verdict arrive first).
+    // A "no foreground" reading skips this wait (activation is stuck).
     private const int ReleaseAmbiguousMs = 300;
-    // No foreground at all right after Alt-up ("pid 0"): the shell's activation
-    // is stuck on the frozen target (a running window takes the foreground
-    // within ~10-50ms). Resume sooner so the switch lands promptly; a false
-    // positive only leaves the target running for one recovery window.
-    private const int ReleaseIdleMs = 120;
 
     /// <summary>Hook-safe snapshot of the about-to-be-left foreground (see above).</summary>
     public static void NoteModifierHeld()
@@ -2644,14 +2646,16 @@ public static class ProcessSuspenderApp
             int waitMs = HasLockedTargets() ? pollMs : 2000;
             if (releasePending)
             {
-                // Wake exactly when the release grace expires. Sleeping the
-                // full poll interval past the deadline added up to 250ms of
-                // frozen-window lag on every switch back to the target.
-                DateTime due = releaseResumeAt;
-                int remaining = due == DateTime.MinValue
-                    ? 25
-                    : (int)Math.Ceiling((due - DateTime.UtcNow).TotalMilliseconds);
-                if (remaining < waitMs) waitMs = Math.Max(1, remaining);
+                // Poll in short slices while the release decision is pending so
+                // a "no foreground" reading (the shell failing to activate the
+                // frozen target) is caught immediately. The foreground WinEvent
+                // usually wakes us first; this is the guaranteed fallback. After
+                // ReleaseAmbiguousMs the decision itself resolves, so cap the
+                // slice at the remaining grace.
+                int remaining = (int)Math.Ceiling(
+                    (releaseAt.AddMilliseconds(ReleaseAmbiguousMs) - DateTime.UtcNow).TotalMilliseconds);
+                int slice = remaining <= 0 ? 1 : Math.Min(remaining, 25);
+                if (slice < waitMs) waitMs = Math.Max(1, slice);
             }
             try { wakeEvent.WaitOne(waitMs); }
             catch { try { Thread.Sleep(waitMs); } catch { } }
