@@ -138,7 +138,6 @@ public class Hotkeys : IDisposable
         Keys kc = keyData & Keys.KeyCode;
         if (kc == Keys.None) return null;
         string key = KeyName(kc);
-        if (key.Length == 0) return null;
         var parts = new List<string>();
         if ((keyData & Keys.Control) != 0) parts.Add("Ctrl");
         if ((keyData & Keys.Alt) != 0) parts.Add("Alt");

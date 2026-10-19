@@ -18,7 +18,6 @@ public static class AppTheme
     private static readonly Color LightCard = Color.FromArgb(255, 255, 255);
     private static readonly Color LightCardBorder = Color.FromArgb(225, 225, 225);
     private static readonly Color LightInputBack = Color.FromArgb(255, 255, 255);
-    private static readonly Color LightInputBorder = Color.FromArgb(210, 210, 210);
     private static readonly Color LightFore = Color.FromArgb(27, 27, 27);
     private static readonly Color LightSecondary = Color.FromArgb(97, 97, 97);
     private static readonly Color LightHover = Color.FromArgb(245, 245, 245);
@@ -28,7 +27,6 @@ public static class AppTheme
     private static readonly Color DarkCard = Color.FromArgb(45, 45, 45);
     private static readonly Color DarkCardBorder = Color.FromArgb(62, 62, 62);
     private static readonly Color DarkInputBack = Color.FromArgb(45, 45, 45);
-    private static readonly Color DarkInputBorder = Color.FromArgb(80, 80, 80);
     private static readonly Color DarkFore = Color.FromArgb(255, 255, 255);
     private static readonly Color DarkSecondary = Color.FromArgb(199, 199, 199);
     private static readonly Color DarkHover = Color.FromArgb(62, 62, 62);
@@ -103,7 +101,6 @@ public static class AppTheme
     public static Color Fore(bool dark) { return dark ? DarkFore : LightFore; }
     public static Color SecondaryFore(bool dark) { return dark ? DarkSecondary : LightSecondary; }
     public static Color InputBack(bool dark) { return dark ? DarkInputBack : LightInputBack; }
-    public static Color InputBorder(bool dark) { return dark ? DarkInputBorder : LightInputBorder; }
     public static Color HoverBack(bool dark) { return dark ? DarkHover : LightHover; }
 
     /// <summary>System accent color, or Fluent blue fallback.</summary>
@@ -453,7 +450,6 @@ public static class AppTheme
         {
             Color page = PageBack(dark);
             Color card = CardBack(dark);
-            Color cardBorder = CardBorder(dark);
             Color fore = Fore(dark);
             Color secondary = SecondaryFore(dark);
             Color inputBack = InputBack(dark);
@@ -552,14 +548,6 @@ public static class AppTheme
                 try { c.Font = UiFont(9f); } catch { }
                 try { ((NumericUpDown)c).BorderStyle = BorderStyle.FixedSingle; } catch { }
             }
-            else if (c is CheckBox)
-            {
-                CheckBox ch = (CheckBox)c;
-                ch.BackColor = Color.Transparent;
-                ch.ForeColor = fore;
-                try { ch.Font = UiFont(9f); } catch { }
-                try { ch.UseVisualStyleBackColor = false; } catch { }
-            }
             else if (c is RadioButton)
             {
                 RadioButton rb = (RadioButton)c;
@@ -594,26 +582,6 @@ public static class AppTheme
                     c.ForeColor = isHint ? secondary : fore;
                     try { c.Font = UiFont(9f); } catch { }
                 }
-            }
-            else if (c is GroupBox)
-            {
-                // Legacy containers render as Fluent cards.
-                c.BackColor = card;
-                c.ForeColor = fore;
-                try { c.Font = UiFont(10f, FontStyle.Bold); } catch { }
-            }
-            else if (c is TabControl)
-            {
-                c.BackColor = page;
-                c.ForeColor = fore;
-                try { c.Font = UiFont(9f); } catch { }
-            }
-            else if (c is TabPage)
-            {
-                TabPage tp = (TabPage)c;
-                try { tp.UseVisualStyleBackColor = false; } catch { }
-                tp.BackColor = page;
-                tp.ForeColor = fore;
             }
             else if (c is Panel)
             {
@@ -800,7 +768,6 @@ public class FluentCard : Panel
             g.Clear(Parent != null ? Parent.BackColor : AppTheme.PageBack(_dark));
             Color fill = AppTheme.CardBack(_dark);
             Color border = AppTheme.CardBorder(_dark);
-            Rectangle bounds = new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1));
             using (GraphicsPath path = AppTheme.RoundedRect(new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height)), 8))
             {
                 using (SolidBrush br = new SolidBrush(fill))
@@ -917,7 +884,6 @@ public class FluentToggle : CheckBox
             int knobY = pillY + (pillH - knobD) / 2;
             int knobX = Checked ? pill.Right - knobD - 4 : pill.X + 4;
             Color knob = Checked ? Color.White : (_dark ? Color.White : Color.FromArgb(90, 90, 90));
-            if (!Checked && !_dark) knob = Color.FromArgb(90, 90, 90);
             if (!Checked && _dark) knob = Color.FromArgb(220, 220, 220);
             using (SolidBrush br = new SolidBrush(knob))
             {

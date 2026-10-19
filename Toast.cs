@@ -55,7 +55,6 @@ internal static class Toast
         private int _ticks;
         private readonly bool _dark;
         private readonly string _text;
-        private readonly Font _font;
 
         public ToastForm(string text)
         {
@@ -68,9 +67,10 @@ internal static class Toast
             StartPosition = FormStartPosition.Manual;
             DoubleBuffered = true;
 
-            try { _font = AppTheme.UiFont(9.5f); }
-            catch { _font = new Font("Segoe UI", 9.5f); }
-            Font = _font;
+            Font font;
+            try { font = AppTheme.UiFont(9.5f); }
+            catch { font = new Font("Segoe UI", 9.5f); }
+            Font = font;
 
             // Fluent notification card: wrap long text, cap width like Win11.
             int maxW = 420;

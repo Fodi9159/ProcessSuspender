@@ -123,8 +123,6 @@ public static class ProcessSuspenderApp
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr hwnd, StringBuilder sb, int max);
     [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr hwnd);
-    [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hwnd, int nCmdShow);
@@ -305,10 +303,7 @@ public static class ProcessSuspenderApp
     public static bool Enabled
     {
         get { return enabled; }
-        set { enabled = value; }
     }
-
-    public static int PollMs { get { return pollMs; } }
 
     /// <summary>True when at least one process/window target is locked.</summary>
     public static bool HasLockedTargets()
@@ -412,40 +407,6 @@ public static class ProcessSuspenderApp
         }
     }
 
-    /// <summary>One line per locked window, each with its current suspended/active state. Empty string when none.</summary>
-    public static string LockedTargetsDescription
-    {
-        get
-        {
-            lock (StateLock)
-            {
-                var parts = new List<string>();
-                if (targetName != null)
-                {
-                    string state = "active";
-                    foreach (int pid in NamePids)
-                    {
-                        if (Suspended.Contains(pid)) { state = "SUSPENDED"; break; }
-                        if (Throttled.Contains(pid)) { state = "THROTTLED (Eco)"; break; }
-                    }
-                    string title = FirstMatchingWindowTitle(targetName);
-                    string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
-                    parts.Add("process \"" + targetName + "\"" + extra + " - " + state);
-                }
-                foreach (WindowTarget t in WindowTargets)
-                {
-                    bool suspended = Suspended.Contains((int)t.Pid);
-                    bool throttled = Throttled.Contains((int)t.Pid);
-                    string title = GetWindowTitle(t.Hwnd);
-                    string extra = title.Length > 0 ? " (\"" + title + "\")" : "";
-                    string state = suspended ? "SUSPENDED" : (throttled ? "THROTTLED (Eco)" : "active");
-                    parts.Add(DescribeProcess((int)t.Pid) + extra + " (pid " + t.Pid + ") - " + state);
-                }
-                return string.Join("\r\n", parts.ToArray());
-            }
-        }
-    }
-
     /// <summary>Locked window entries (Pick / Lock hotkey) with their suspended state, for the tray menu.</summary>
     public sealed class LockedEntry
     {
@@ -522,23 +483,16 @@ public static class ProcessSuspenderApp
         try
         {
             Process[] list = Process.GetProcessesByName(name);
-            try
+            foreach (Process p in list)
             {
-                foreach (Process p in list)
+                try
                 {
-                    try
-                    {
-                        IntPtr mw = p.MainWindowHandle;
-                        if (mw == IntPtr.Zero) continue;
-                        string t = GetWindowTitle(mw);
-                        if (t.Length > 0) return t;
-                    }
-                    finally { try { p.Dispose(); } catch { } }
+                    IntPtr mw = p.MainWindowHandle;
+                    if (mw == IntPtr.Zero) continue;
+                    string t = GetWindowTitle(mw);
+                    if (t.Length > 0) return t;
                 }
-            }
-            finally
-            {
-                // individual Processes already disposed; array needs no dispose
+                finally { try { p.Dispose(); } catch { } }
             }
         }
         catch { }
@@ -676,15 +630,6 @@ public static class ProcessSuspenderApp
         }
     }
 
-    private static int SelfPid
-    {
-        get
-        {
-            try { return Process.GetCurrentProcess().Id; }
-            catch { return -1; }
-        }
-    }
-
     private static bool IsSelfPid(uint pid)
     {
         try { return (uint)Process.GetCurrentProcess().Id == pid; }
@@ -773,22 +718,18 @@ public static class ProcessSuspenderApp
                 if (IsNeverSuspendName(name)) continue;
                 if (name.Equals(Process.GetCurrentProcess().ProcessName, StringComparison.OrdinalIgnoreCase)) continue;
                 Process[] list = Process.GetProcessesByName(name);
-                try
+                foreach (Process p in list)
                 {
-                    foreach (Process p in list)
+                    try
                     {
-                        try
+                        if (p.MainWindowHandle != IntPtr.Zero)
                         {
-                            if (p.MainWindowHandle != IntPtr.Zero)
-                            {
-                                AddTargetWindow(p.MainWindowHandle, (uint)p.Id);
-                                break;
-                            }
+                            AddTargetWindow(p.MainWindowHandle, (uint)p.Id);
+                            break;
                         }
-                        finally { try { p.Dispose(); } catch { } }
                     }
+                    finally { try { p.Dispose(); } catch { } }
                 }
-                finally { }
             }
             catch { }
         }
@@ -842,7 +783,6 @@ public static class ProcessSuspenderApp
             Log("[WARN] \"" + DescribeProcess((int)pid) + "\" is in the never-suspend list - not locking it.");
             return;
         }
-        bool added = false;
         lock (StateLock)
         {
             if (FindWindowTarget(hwnd) != null) return;
@@ -852,10 +792,9 @@ public static class ProcessSuspenderApp
             WindowTargets.Add(t);
             OpenHandleLocked((int)pid);
             Log("[INFO] Added locked window " + DescribeProcess((int)pid) + " (pid " + pid + "). Total: " + WindowTargets.Count);
-            added = true;
         }
-        if (added) PersistLockedProcesses();
-        if (added) NotifyTargetsChanged();
+        PersistLockedProcesses();
+        NotifyTargetsChanged();
     }
 
     /// <summary>Adds (or removes, if focused) the given window to the locked set. Returns a short result message.</summary>
@@ -923,7 +862,6 @@ public static class ProcessSuspenderApp
     /// <summary>Removes a locked window by index (used by the tray menu).</summary>
     public static void RemoveWindowTarget(int index)
     {
-        bool changed = false;
         lock (StateLock)
         {
             if (index < 0 || index >= WindowTargets.Count) return;
@@ -932,10 +870,9 @@ public static class ProcessSuspenderApp
             DropHandleLocked((int)t.Pid);
             DropChildrenOf((int)t.Pid);
             Log("[INFO] Unlocked " + DescribeProcess((int)t.Pid) + " (pid " + t.Pid + ") from tray.");
-            changed = true;
         }
-        if (changed) PersistLockedProcesses();
-        if (changed) NotifyTargetsChanged();
+        PersistLockedProcesses();
+        NotifyTargetsChanged();
     }
 
     private static WindowTarget FindWindowTarget(IntPtr hwnd)
@@ -1002,14 +939,6 @@ public static class ProcessSuspenderApp
         {
             pendingForegroundSuspend = true;
             gestureCommitPid = 0; // new episode: drop any previous commit
-            // The Tab that STARTED this gesture was already counted by the hook
-            // (CountGestureTab runs in the same key-down callback, before this
-            // state change). Resetting to 0 threw that count away and made every
-            // ordinary single-Tab Alt+Tab look like a pure Alt tap, so the whole
-            // release decision was skipped. Seed at 1 instead (also covers the
-            // Tab-held-first path, where the gesture starts from the physical
-            // Tab state without a key-down on our hook).
-            gestureTabCount = 1;
             releasePending = false;
         }
         else
@@ -1036,14 +965,6 @@ public static class ProcessSuspenderApp
             if (committed)
             {
                 try { Log("[INPUT] switch gesture ended (committed, no resume)"); }
-                catch { }
-                return;
-            }
-            // Pure Alt-tap (no Tab navigation, no click): no switch could have
-            // happened. Skip everything - zero blip.
-            if (gestureTabCount == 0)
-            {
-                try { Log("[INPUT] switch gesture ended (no navigation, no resume)"); }
                 catch { }
                 return;
             }
@@ -1235,19 +1156,11 @@ public static class ProcessSuspenderApp
         return kbdSwitching;
     }
 
-    /// <summary>Hook-safe Tab counter for the release decision (see releasePending).</summary>
-    public static void CountGestureTab()
-    {
-        try { gestureTabCount++; }
-        catch { }
-    }
-
     // Release-decision state (hook writes, worker reads): the hook records the
-    // pre-switch foreground + Tab count at Alt-up and wakes the worker, which
-    // decides in EvaluateReleasePending once the shell has landed.
+    // pre-switch foreground at Alt-up and wakes the worker, which decides in
+    // EvaluateReleasePending once the shell has landed.
     private static volatile bool releasePending;
     private static volatile uint releaseFgBefore;
-    private static volatile int gestureTabCount;
     // Window that owned the foreground when the gesture started (the window
     // being left). Lets the release decision tell "switching away from the
     // target" (ambiguous landing = stayed away, keep it frozen) from
@@ -1467,15 +1380,16 @@ public static class ProcessSuspenderApp
     }
 
     /// <summary>
-    /// Hook-safe taskbar hit test. Whenever any button data is cached, only a
-    /// click on the target's own taskbar button resumes it - in every tray mode,
+    /// Hook-safe taskbar hit test. Whenever any button data is cached, a click
+    /// on the target's own taskbar button resumes it - in every tray mode,
     /// stale or not. Clicks on other apps' buttons, the tray, clock, Start,
     /// Search or empty gaps return false so a suspended game stays frozen. Uses
     /// only data the worker cached (button rects + target exe/title); never
     /// touches Process, UIA, EnumWindows or Log (all would stall the low-level
-    /// hook). Only when no button data exists at all (Legacy/Unknown mode with
-    /// an empty cache, or the target identity is unverifiable) does it return
-    /// true, preserving resume-first so a click never leaves the game stuck.
+    /// hook). It returns true only when the cache cannot decide: no button data
+    /// exists (Legacy/Unknown mode), the target identity is unverifiable, or a
+    /// stale cache leaves a near-button click ambiguous - preserving resume-first
+    /// so a click never leaves the game stuck.
     /// The out match string describes the verdict; the background resume thread
     /// logs it (hook thread never logs).
     /// </summary>
@@ -2207,7 +2121,7 @@ public static class ProcessSuspenderApp
         catch { return false; }
     }
 
-    /// <summary>All descendant windows of root (breadth-first, DFS via stack).</summary>
+    /// <summary>All descendant windows of root (depth-first via stack).</summary>
     private static IEnumerable<IntPtr> DescendantWindows(IntPtr root)
     {
         var stack = new Stack<IntPtr>();
@@ -2246,9 +2160,9 @@ public static class ProcessSuspenderApp
     private static DateTime taskbarWindowsAt = DateTime.MinValue;
 
     /// <summary>
-    /// All taskbars on all monitors, cached for 500ms. Runs inside the low-level
-    /// mouse hook on every left click, so the full EnumWindows scan must not run
-    /// per event. Callers must treat the returned list as read-only.
+    /// All taskbars on all monitors, cached for 2 seconds. Worker-only: the
+    /// mouse hook reads the precomputed rects, never this scan. Callers must
+    /// treat the returned list as read-only.
     /// </summary>
     private static List<IntPtr> EnumTaskbars()
     {
@@ -2619,12 +2533,11 @@ public static class ProcessSuspenderApp
     private static void WorkerLoop()
     {
         DateTime lastFlush = DateTime.UtcNow;
-        int tick = 0;
         while (running)
         {
             try
             {
-                RunWorkerTick(tick);
+                RunWorkerTick();
             }
             catch (Exception ex)
             {
@@ -2632,7 +2545,6 @@ public static class ProcessSuspenderApp
                 // log and keep polling instead.
                 try { Log("[WARN] Worker error: " + ex.Message); } catch { }
             }
-            tick++;
             if ((DateTime.UtcNow - lastFlush).TotalMilliseconds >= 1000)
             {
                 lastFlush = DateTime.UtcNow;
@@ -2663,7 +2575,7 @@ public static class ProcessSuspenderApp
         try { FlushLogToFile(); } catch { }
     }
 
-    private static void RunWorkerTick(int tick)
+    private static void RunWorkerTick()
     {
         // No locked target: nothing to freeze/resume/watch. Stay idle and keep
         // the caches untouched until a target is locked.
@@ -3050,7 +2962,7 @@ public static class ProcessSuspenderApp
 
     private class ProcInfo { public int Pid, Parent; public string Name; }
 
-    // Children of parentPid from the latest snapshot, or null when no snapshot.
+    // Children of parentPid from a process snapshot (empty when none).
     private static HashSet<int> ChildPids(List<ProcInfo> snap, int parentPid)
     {
         var kids = new HashSet<int>();
@@ -3234,8 +3146,7 @@ public static class ProcessSuspenderApp
 
     /// <summary>
     /// Freezes one pid right now, bypassing switch grace / settle / recovery.
-    /// Used by the normal defocus path (after its gates pass) and by the
-    /// release-decision fast paths (which confirmed the switch landed elsewhere).
+    /// Used by the normal defocus path after its gates pass.
     /// Caller must hold StateLock.
     /// </summary>
     private static void FreezeLocked(int pid, IntPtr h, bool eco, string reasonSuffix)
@@ -3307,7 +3218,7 @@ public static class ProcessSuspenderApp
 
     // ---- Eco (low-power) implementation ----
     // Caller must hold StateLock. Best-effort: IDLE priority + EcoQoS +
-    // Job CPU hard cap (1% floor). A pid is added to Throttled even when
+    // Job CPU hard cap (0.1% floor). A pid is added to Throttled even when
     // only part of the chain succeeded, so RestoreEcoLocked still runs
     // on focus.
 
@@ -3352,8 +3263,8 @@ public static class ProcessSuspenderApp
         if (!Throttled.Contains(pid) && !OrigPriority.ContainsKey(pid) && !EcoJobs.ContainsKey(pid))
             return;
         SetEcoQoS(h, false);
-        uint orig = NORMAL_PRIORITY_CLASS;
-        if (OrigPriority.TryGetValue(pid, out orig) && orig == 0)
+        uint orig;
+        if (!OrigPriority.TryGetValue(pid, out orig) || orig == 0)
             orig = NORMAL_PRIORITY_CLASS;
         try { SetPriorityClass(h, orig); }
         catch { }
@@ -4040,11 +3951,8 @@ public static class Program
                     var picks = WindowPicker.GetSelectedTargets();
                     ProcessSuspenderApp.Config.ProcessName = "";
                     SettingsStore.Save(ProcessSuspenderApp.Config);
-                    if (picks != null)
-                    {
-                        foreach (var kv in picks)
-                            ProcessSuspenderApp.AddTargetWindow(kv.Key, kv.Value);
-                    }
+                    foreach (var kv in picks)
+                        ProcessSuspenderApp.AddTargetWindow(kv.Key, kv.Value);
                 }
             }
 

@@ -12,7 +12,6 @@ public class SettingsForm : Form
     private Button[] _navButtons;
     private Panel[] _pages;
     private int _selectedPage;
-    private Panel _contentPanel;
     private HotkeyBox _txtLockHotkey;
     private HotkeyBox _txtFreezeHotkey;
     private NumericUpDown _numPoll;
@@ -217,9 +216,9 @@ public class SettingsForm : Form
         nav.Padding = new Padding(4, 4, 12, 4);
         // NOTE: added at the end of BuildUi in Fill-first dock order.
 
-        _contentPanel = new Panel();
-        _contentPanel.Dock = DockStyle.Fill;
-        _contentPanel.Padding = new Padding(4, 4, 4, 4);
+        Panel contentPanel = new Panel();
+        contentPanel.Dock = DockStyle.Fill;
+        contentPanel.Padding = new Padding(4, 4, 4, 4);
         // NOTE: added at the end of BuildUi in Fill-first dock order.
 
         _navButtons = new Button[NavTitles.Length];
@@ -246,7 +245,7 @@ public class SettingsForm : Form
             p.AutoScroll = true;
             p.Padding = new Padding(4, 4, 10, 10);
             p.Visible = (i == 0);
-            _contentPanel.Controls.Add(p);
+            contentPanel.Controls.Add(p);
             // Fill-docked pages stack; keep only selected on top.
             try { p.BringToFront(); } catch { }
             _pages[i] = p;
@@ -265,7 +264,7 @@ public class SettingsForm : Form
         // the screenshot showed (card labels hidden behind the nav, first
         // card hidden behind the header). Fill must be added FIRST so edges
         // take their strip and Fill gets the remainder.
-        main.Controls.Add(_contentPanel); // Fill first -> remainder
+        main.Controls.Add(contentPanel); // Fill first -> remainder
         main.Controls.Add(nav);           // Left second -> left strip
         Controls.Add(main);               // Fill first -> middle remainder
         Controls.Add(footer);             // Bottom second -> bottom strip
@@ -984,7 +983,6 @@ public class HotkeyBox : TextBox
     {
         return k == Keys.ControlKey || k == Keys.LControlKey || k == Keys.RControlKey
             || k == Keys.Menu || k == Keys.LMenu || k == Keys.RMenu
-            || k == Keys.ShiftKey || k == Keys.LShiftKey || k == Keys.RShiftKey
-            || k == Keys.Control || k == Keys.Alt || k == Keys.Shift;
+            || k == Keys.ShiftKey || k == Keys.LShiftKey || k == Keys.RShiftKey;
     }
 }

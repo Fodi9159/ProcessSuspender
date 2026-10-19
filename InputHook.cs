@@ -118,7 +118,6 @@ public sealed class InputHook : IDisposable
     private readonly ManualResetEvent _ready = new ManualResetEvent(false);
     private const uint WM_APP_HOOK_STATE = 0x8000 + 1; // re-apply _wantHooks/_wantMouse
     private const uint WM_APP_HOOK_QUIT = 0x8000 + 2;  // exit the hook thread
-    private readonly bool[] _keyDown = new bool[256];
     private bool _altDown;
     private bool _winDown;
     private bool _tabSinceAlt;
@@ -270,12 +269,10 @@ public sealed class InputHook : IDisposable
             HealStuckKeys(kb.vkCode);
             if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
             {
-                if (kb.vkCode < 256) _keyDown[kb.vkCode] = true;
                 if (IsAlt(kb.vkCode))
                 {
                     // Fresh Alt hold: Tab must be pressed during THIS hold to count.
-                    // Seed from the physical Tab state so Tab-held-first still counts,
-                    // but a stale _keyDown[VK_TAB] can never fake a gesture.
+                    // Seed from the physical Tab state so Tab-held-first still counts.
                     if (!_altDown)
                     {
                         _tabSinceAlt = IsTabPhysicallyDown();
@@ -299,13 +296,10 @@ public sealed class InputHook : IDisposable
                 else if (kb.vkCode == VK_TAB && (_altDown || _winDown))
                 {
                     _tabSinceAlt = true;
-                    try { ProcessSuspenderApp.CountGestureTab(); }
-                    catch { }
                 }
             }
             else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
             {
-                if (kb.vkCode < 256) _keyDown[kb.vkCode] = false;
                 if (IsAlt(kb.vkCode)) _altDown = false;
                 if (IsWin(kb.vkCode)) _winDown = false;
             }
@@ -317,9 +311,8 @@ public sealed class InputHook : IDisposable
 
             // Only treat the gesture as a window switch when Tab is used while Alt
             // or Win is held (a real Alt+Tab / Win+Tab). A stray Alt press (menus,
-            // shortcuts) must not unfreeze the game. NOTE: deliberately NOT using
-            // _keyDown[VK_TAB] here - a stuck Tab entry (missed key-up) used to make
-            // every stray Alt press look like Alt+Tab (resume then re-suspend).
+            // shortcuts) must not unfreeze the game: _tabSinceAlt is latched only
+            // during the current modifier hold.
             bool active = modifierHeld && _tabSinceAlt;
             if (active != _lastSwitch)
             {
@@ -363,7 +356,6 @@ public sealed class InputHook : IDisposable
     {
         try
         {
-            if (currentVk != VK_TAB && _keyDown[VK_TAB] && !IsTabPhysicallyDown()) _keyDown[VK_TAB] = false;
             if (!IsAlt(currentVk) && _altDown && !IsAltPhysicallyDown()) _altDown = false;
             if (!IsWin(currentVk) && _winDown && !IsWinPhysicallyDown()) _winDown = false;
         }
@@ -446,8 +438,8 @@ public sealed class InputHook : IDisposable
     public void Dispose()
     {
         // Ask the hook thread to quit (it also removes the hooks on the way
-        // out), then wait for it. The fallback below cleans up if the thread
-        // was never started or did not exit: unhooking from any thread is safe.
+        // out), then wait for it. The fallback below unhooks if the thread did
+        // not exit in time.
         try
         {
             uint tid = _threadId;
