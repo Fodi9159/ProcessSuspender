@@ -36,7 +36,7 @@ Right-click the tray icon:
 
 | Hotkey | Action |
 |---|---|
-| `Ctrl+Alt+F9` | Lock onto the currently focused window — press it *while playing* |
+| `Ctrl+Alt+F9` | Lock onto the currently focused window, press it *while playing* |
 | `Ctrl+Alt+F10` | Enable/disable the app (disabling resumes targets and focuses the game) |
 
 Both combos are **customizable**: open Settings -> Hotkeys, click a field,
